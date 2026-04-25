@@ -81,9 +81,12 @@ def _parse_vlm_response(raw: str) -> tuple[list[dict[str, Any]], dict[str, Any] 
         return [], {"parse_error": "json", "raw_preview": raw[:10000]}
 
     it: list[Any] | None = None
+    composed: list[Any] | None = None
     if isinstance(data, dict):
         v = data.get("items")
         it = v if isinstance(v, list) else None
+        v2 = data.get("composed_items")
+        composed = v2 if isinstance(v2, list) else None
     elif isinstance(data, list):
         it = data
 
@@ -96,7 +99,11 @@ def _parse_vlm_response(raw: str) -> tuple[list[dict[str, Any]], dict[str, Any] 
             continue
         d = cast(dict[str, Any], x)
         out.append(_normalize_segment(d))
-    return (out, None)
+    extra: dict[str, Any] | None = None
+    if composed is not None:
+        # 透传给 structured_file，供后续离线 llm-compose 提取
+        extra = {"composed_items": composed}
+    return (out, extra)
 
 
 def _cap_workers(n_tasks: int, raw: Any) -> int:
@@ -225,6 +232,13 @@ def run_vlm_text_only(
             items, extra = _parse_vlm_response(raw)
             if extra:
                 _log.warning("page_id=%s VLM 解析需人工检查: %s", page_id, list(extra.keys()))
+            if not items and not extra:
+                _log.warning(
+                    "page_id=%s VLM 返回空 items：请检查 vlm.model / VLM_MODEL 是否为支持读图的多模态模型；"
+                    "原始回复前 800 字：%s",
+                    page_id,
+                    (raw or "")[:800],
+                )
             _, __, row = export_vlm_classified_artifact(
                 work=out,
                 page_id=page_id,

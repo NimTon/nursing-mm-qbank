@@ -15,7 +15,8 @@ page_text:
 
 # 多模态 VLM 整页转写（按次计费；未填 max_long_edge 时回退 preprocess.max_long_edge）
 vlm:
-  model: qwen3-max
+  # 须为「图像+文本」多模态名（如百炼 qwen-vl-plus / qwen3-vl-plus、OpenAI gpt-4o）；填纯文本模型（如 qwen3-max）会跑通接口但 items 常为空
+  model: qwen3.6-plus
   # 多图同时请求 VLM 的线程数（整批跑完再进入 llm-compose；缺省为 CPU 与任务数合算的上限）
   max_workers: 8
   max_long_edge: 2000
@@ -23,20 +24,15 @@ vlm:
   temperature: 0.1
   timeout_seconds: 300.0
 
-# llm-compose：整页转写后按页拆题（.env 的 LLM_BASE_URL / LLM_API_KEY / LLM_MODEL）
-llm:
-  # 多页同时请求拆题 LLM 的线程数（VLM 全部完成后再跑本步）
-  max_workers: 8
-  # 未填则使用 .env 的 LLM_MODEL（及 CLI --model 覆盖）
-  model: qwen3-max
-  temperature: 0.15
+# llm-compose：已改为**离线提取**（从每页 structured_file 的 composed_items 汇总为 jsonl），不再调用模型，因此无需 model/temperature/max_workers 配置
 
 # vlm-refine：按题号合并后教材向修正，并导 xlsx
 # web_search: true 时对类 DashScope 基址可附加联网请求头（以供应商为准）
 refine:
   model: qwen3-max
+  batch_size: 30
   # 多批题块同时请求修正 LLM（批与 batch_size 同序；VLM+compose 均完成后再跑本步）
-  max_workers: 4
+  max_workers: 8
   temperature: 0.2
-  web_search: false
+  web_search: true
   timeout_seconds: 180.0

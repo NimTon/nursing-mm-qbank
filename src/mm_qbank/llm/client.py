@@ -45,6 +45,28 @@ class OpenAICompatClient:
         choice = resp.choices[0].message
         return (choice.content or "").strip()
 
+    def chat_text_plain(
+        self,
+        *,
+        model: str,
+        messages: list[dict[str, Any]],
+        temperature: float = 0.0,
+        max_tokens: int = 64,
+        timeout: float | None = 45.0,
+    ) -> str:
+        """纯文本补全，不要求 JSON；用于配置自检等。"""
+        kwargs: dict[str, Any] = {
+            "model": model,
+            "messages": messages,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+        }
+        if timeout is not None:
+            kwargs["timeout"] = timeout
+        resp = self._client.chat.completions.create(**kwargs)
+        choice = resp.choices[0].message
+        return (choice.content or "").strip()
+
     def chat_vision(
         self,
         *,

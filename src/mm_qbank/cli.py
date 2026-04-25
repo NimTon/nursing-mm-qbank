@@ -5,6 +5,7 @@ import json
 import logging
 from pathlib import Path
 
+from mm_qbank.api_verify import run_verify
 from mm_qbank.logging_utils import configure_logging
 from mm_qbank.pipeline.llm_compose_run import run_llm_compose_manifest
 from mm_qbank.pipeline.refine_vlm_run import run_refine_vlm_merged
@@ -97,6 +98,19 @@ def main() -> None:
     llm.add_argument("--config", dest="config", type=Path, default=None, help="覆盖默认 configs/default.yaml")
     llm.add_argument("--model", dest="model", type=str, default=None, help="覆盖环境变量 LLM_MODEL")
 
+    verify = sub.add_parser(
+        "verify-config",
+        parents=[parent],
+        help="各发一次请求：VLM 描述测试图、LLM 发「你好」，校验网关/密钥/模型（产生少量计费）",
+    )
+    verify.add_argument("--config", dest="verify_config", type=Path, default=None, help="configs/default.yaml")
+    verify.add_argument("--vlm-only", action="store_true", help="只测 VLM")
+    verify.add_argument("--llm-only", action="store_true", help="只测 LLM")
+    verify.add_argument("--vlm-model", type=str, default=None, help="覆盖 VLM 模型名")
+    verify.add_argument("--llm-model", type=str, default=None, help="覆盖 LLM 模型名")
+    verify.add_argument("--vlm-timeout", type=float, default=90.0)
+    verify.add_argument("--llm-timeout", type=float, default=45.0)
+
     args = parser.parse_args()
     configure_logging(verbose=bool(args.verbose), quiet=bool(args.quiet))
     _log.info("子命令: %s", args.cmd)
@@ -126,6 +140,19 @@ def main() -> None:
             model=args.model,
         )
         print(json.dumps(summary, ensure_ascii=False, indent=2))
+    elif args.cmd == "verify-config":
+        summary = run_verify(
+            config_path=args.verify_config,
+            vlm_model=args.vlm_model,
+            llm_model=args.llm_model,
+            vlm_only=args.vlm_only,
+            llm_only=args.llm_only,
+            vlm_timeout=args.vlm_timeout,
+            llm_timeout=args.llm_timeout,
+        )
+        print(json.dumps(summary, ensure_ascii=False, indent=2))
+        if not summary.get("all_ok"):
+            raise SystemExit(1)
 
 
 if __name__ == "__main__":

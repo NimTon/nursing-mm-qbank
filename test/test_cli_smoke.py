@@ -5,6 +5,21 @@ import sys
 from pathlib import Path
 
 
+def test_verify_config_help_exits_zero() -> None:
+    root = Path(__file__).resolve().parents[1]
+    exe = sys.executable
+    r = subprocess.run(
+        [exe, "-m", "mm_qbank.cli", "verify-config", "-h"],
+        cwd=root,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert r.returncode == 0
+    out = r.stdout or ""
+    assert "VLM" in out or "vlm" in out.lower()
+
+
 def test_mm_qbank_cli_help_exits_zero() -> None:
     root = Path(__file__).resolve().parents[1]
     exe = sys.executable

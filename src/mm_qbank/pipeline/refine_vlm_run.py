@@ -7,6 +7,7 @@ import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, cast
+import math
 
 from mm_qbank.config import load_config, llm_text_settings, project_root
 from mm_qbank.io.xlsx_out import write_refined_rows_to_xlsx
@@ -49,24 +50,32 @@ def _text_norm(s: str) -> str:
 def _normalize_out_item(
     m: dict[str, str], raw: dict[str, Any]
 ) -> dict[str, Any]:
-    """以合并表 `m` 为准定「原*」，以模型出「修正*」等；`修正状态` 由后处理按文本是否实质变化重算。"""
+    """以合并表 `m` 为准定「原*」，对模型输出做归一化。
+
+    规则：当 `修正状态=false`（或输出与原文等价）时，除 `题号` / `原问题` / `原解析` 外其余字段必须清空。
+    """
     题 = m.get("题号", "")
     原问 = m.get("问题", "")
     原析 = m.get("解析", "")
-    修q = str(raw.get("修正后问题", "") or "").strip() or 原问
-    修a = str(raw.get("修正后解析", "") or "").strip() or 原析
-    return {
+    修q_raw = str(raw.get("修正后问题", "") or "").strip()
+    修a_raw = str(raw.get("修正后解析", "") or "").strip()
+    修q = 修q_raw or 原问
+    修a = 修a_raw or 原析
+    changed = _text_norm(修q) != _text_norm(原问) or _text_norm(修a) != _text_norm(原析)
+
+    out = {
         "题号": str(raw.get("题号", 题) or 题).strip() or 题,
         "原问题": 原问,
         "原解析": 原析,
-        "修正后问题": 修q,
-        "修正问题原因": str(raw.get("修正问题原因", "") or "").strip(),
-        "修正问题参考来源": str(raw.get("修正问题参考来源", "") or "").strip(),
-        "修正后解析": 修a,
-        "修正解析原因": str(raw.get("修正解析原因", "") or "").strip(),
-        "修正解析参考来源": str(raw.get("修正解析参考来源", "") or "").strip(),
-        "修正状态": _text_norm(修q) != _text_norm(原问) or _text_norm(修a) != _text_norm(原析),
+        "修正后问题": 修q_raw if changed else "",
+        "修正问题原因": (str(raw.get("修正问题原因", "") or "").strip() if changed else ""),
+        "修正问题参考来源": (str(raw.get("修正问题参考来源", "") or "").strip() if changed else ""),
+        "修正后解析": 修a_raw if changed else "",
+        "修正解析原因": (str(raw.get("修正解析原因", "") or "").strip() if changed else ""),
+        "修正解析参考来源": (str(raw.get("修正解析参考来源", "") or "").strip() if changed else ""),
+        "修正状态": changed,
     }
+    return out
 
 
 def _parse_refine_response(raw: str) -> list[dict[str, Any]]:
@@ -201,15 +210,39 @@ def run_refine_vlm_merged(
     else:
         rsys = refine_system()
         total = len(merged_all)
-        n_batches = (total + batch_size - 1) // batch_size
-        max_rw = _cap_workers(n_batches, rcfg.get("max_workers"))
-        _log.info("vlm-refine 题块批次数=%s，并行：max_workers=%s", n_batches, max_rw)
 
-        def _refine_one_start(bi: int) -> tuple[int, list[dict[str, Any]]]:
-            chunk = merged_all[bi : bi + batch_size]
+        raw_max_workers = rcfg.get("max_workers")
+
+        # 分批策略：
+        # - total > batch_size：按 batch_size 切批；并发由 max_workers 限制
+        # - total <= batch_size：避免只有 1 批导致“看起来不并行”，改为按 max_workers 尽量均分切成多批并行
+        if total <= batch_size:
+            target_tasks = _cap_workers(total, raw_max_workers)
+            chunk_size = int(math.ceil(total / target_tasks)) if target_tasks > 0 else total
+        else:
+            chunk_size = batch_size
+
+        batches: list[tuple[int, int, int]] = []
+        for batch_idx, st in enumerate(range(0, total, chunk_size), start=1):
+            ed = min(total, st + chunk_size)
+            batches.append((batch_idx, st, ed))
+
+        n_batches = len(batches)
+        max_rw = _cap_workers(n_batches, raw_max_workers)
+        _log.info(
+            "vlm-refine 题块总数=%s，批次数=%s（chunk_size=%s, batch_size=%s），并行：max_workers=%s",
+            total,
+            n_batches,
+            chunk_size,
+            batch_size,
+            max_rw,
+        )
+
+        def _refine_one_batch(batch_idx: int, st: int, ed: int) -> tuple[int, list[dict[str, Any]]]:
+            chunk = merged_all[st:ed]
             chunk_simple = [{"题号": x["题号"], "问题": x["问题"], "解析": x["解析"]} for x in chunk]
             up = refine_user_payload(
-                page_id=f"跨页合并 {bi//batch_size + 1}", merged=chunk_simple, web_search=web_search
+                page_id=f"跨页合并 {batch_idx}", merged=chunk_simple, web_search=web_search
             )
             c = OpenAICompatClient(
                 api_key=str(tl.get("api_key")),
@@ -218,7 +251,7 @@ def run_refine_vlm_merged(
             )
             _log.info(
                 "[%s/%s] 跨页合并题块 %s 条，请求修正模型",
-                (bi // batch_size) + 1,
+                batch_idx,
                 n_batches,
                 len(chunk_simple),
             )
@@ -252,16 +285,15 @@ def run_refine_vlm_merged(
                 imgs = meta.get("source_images") or []
                 row["source_image"] = imgs[0] if imgs else ""
                 flat_part.append(row)
-            return (bi, flat_part)
+            return (st, flat_part)
 
-        starts = list(range(0, total, batch_size))
-        if max_rw <= 1 or len(starts) <= 1:
-            for st in starts:
-                _, part = _refine_one_start(st)
+        if max_rw <= 1 or n_batches <= 1:
+            for batch_idx, st, ed in batches:
+                _, part = _refine_one_batch(batch_idx, st, ed)
                 flat.extend(part)
         else:
             with ThreadPoolExecutor(max_workers=max_rw) as ex:
-                futs = [ex.submit(_refine_one_start, st) for st in starts]
+                futs = [ex.submit(_refine_one_batch, batch_idx, st, ed) for batch_idx, st, ed in batches]
                 parts: list[tuple[int, list[dict[str, Any]]]] = []
                 for fut in as_completed(futs):
                     parts.append(fut.result())
