@@ -50,7 +50,8 @@ def test_vlm_text_subparser_help() -> None:
     assert r.returncode == 0
     out = r.stdout or ""
     assert "--in" in out
-    assert "--model" in out or "OPENAI" in out.replace("\n", " ")
+    assert "--model" in out
+    assert "VLM_MODEL" in out
 
 
 def test_vlm_text_accepts_verbose_after_subcommand_not_unrecognized(tmp_path: Path) -> None:

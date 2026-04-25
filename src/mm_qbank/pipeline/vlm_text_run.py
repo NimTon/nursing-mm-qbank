@@ -1,15 +1,17 @@
 from __future__ import annotations
 
 import logging
+import os
 import tempfile
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any, cast
 
 from mm_qbank import prompt_builtins as _fb
-from mm_qbank.config import load_config, openai_settings, project_root
+from mm_qbank.config import load_config, project_root, vlm_settings
 from mm_qbank.prompts_loader import get_prompt
 from mm_qbank.layout_postprocess.page_text import export_vlm_classified_artifact, write_page_text_manifest
 from mm_qbank.llm.client import OpenAICompatClient
@@ -97,6 +99,15 @@ def _parse_vlm_response(raw: str) -> tuple[list[dict[str, Any]], dict[str, Any] 
     return (out, None)
 
 
+def _cap_workers(n_tasks: int, raw: Any) -> int:
+    if raw is None or (isinstance(raw, str) and not str(raw).strip()):
+        w = min(32, (os.cpu_count() or 4) * 4)
+    else:
+        w = int(raw)
+    w = max(1, w)
+    return min(w, max(1, n_tasks))
+
+
 def _wait_unpaused(
     *, pause: Callable[[], bool] | None, cancel: threading.Event | None
 ) -> bool:
@@ -122,11 +133,14 @@ def run_vlm_text_only(
     """
     多模态整页转写为 JSON 分类项（`题号` + `问题`/`解析` + `内容`）及合并 `.txt`；
     输出 ``pages.jsonl`` 中每行带 ``structured_file`` 指向每页 ``.json``，供后处理题号级关联。
+
+    同一步内可并行请求多张图（`vlm.max_workers`），顺序与 `pages.jsonl` 仍与文件扫描序一致；下游 llm-compose / vlm-refine
+    须在**本函数全部写完后**由调用方再执行。
     """
     cfg = load_config(config_path)
-    oa = openai_settings()
-    if not oa.get("api_key"):
-        raise ValueError("未配置 API 密钥（OPENAI / DASHSCOPE / 与 DeepSeek 的 DEEPSEEK_API_KEY），无法调用多模态模型")
+    vs = vlm_settings()
+    if not vs.get("api_key"):
+        raise ValueError("未配置 VLM_API_KEY：请在 .env 中设置 VLM_BASE_URL 与 VLM_API_KEY")
     vlm = dict(cfg.get("vlm") or {})
     pre_cfg = dict(cfg.get("preprocess") or {})
     pt = dict(cfg.get("page_text") or {})
@@ -137,7 +151,7 @@ def run_vlm_text_only(
     elif (vlm.get("model") is not None) and str(vlm.get("model", "")).strip():
         m_model = str(vlm.get("model")).strip()
     else:
-        m_model = str(oa.get("mm_model") or "gpt-4o")
+        m_model = str(vs.get("mm_model") or "gpt-4o")
     temp = float(vlm.get("temperature", 0.1))
     timeout = float(vlm.get("timeout_seconds", 300.0))
     use_pre = bool(vlm.get("use_preprocess", True))
@@ -160,18 +174,27 @@ def run_vlm_text_only(
 
     p_sys = get_prompt("vlm_system.txt", _fb.VLM_SYSTEM)
     p_user = get_prompt("vlm_user.txt", _fb.VLM_USER)
-    client = OpenAICompatClient(api_key=str(oa.get("api_key")), base_url=oa.get("base_url") or None)
+    api_key = str(vs.get("api_key"))
+    base_url = vs.get("base_url") or None
+    n_img = len(images)
+    max_workers = _cap_workers(n_img, vlm.get("max_workers"))
+    _log.info("VLM 并行：max_workers=%s（%s 张图）", max_workers, n_img)
+
     manifest_rows: list[dict[str, Any]] = []
     cancelled = False
     with tempfile.TemporaryDirectory(prefix="mm_qbank_vlm_") as tmp:
         tdir = Path(tmp)
-        for i, img_path in enumerate(images, start=1):
+        _prog_lock = threading.Lock()
+        _n_done = 0
+
+        def _run_one(i: int, img_path: Path) -> tuple[int, dict[str, Any] | None, bool]:
+            """(序号, manifest 行或略过, 是否因取消/暂停在请求前中止)"""
+            if cancel_event is not None and cancel_event.is_set():
+                return (i, None, True)
             if _wait_unpaused(pause=paused, cancel=cancel_event):
-                _log.info("vlm-text 在页 %s 前被用户取消/结束", i)
-                cancelled = True
-                break
+                return (i, None, True)
             page_id = page_id_for(img_path)
-            _log.info("[%s/%s] page_id=%s 文件=%s", i, len(images), page_id, img_path.name)
+            _log.info("[%s/%s] page_id=%s 文件=%s", i, n_img, page_id, img_path.name)
             if use_pre:
                 pre_path = tdir / f"{page_id}.png"
                 preprocess_image(
@@ -186,7 +209,10 @@ def run_vlm_text_only(
             else:
                 body = img_path.read_bytes()
                 ctyp = _content_type(img_path.suffix)
-            raw = client.chat_vision(
+            if cancel_event is not None and cancel_event.is_set():
+                return (i, None, True)
+            cl = OpenAICompatClient(api_key=api_key, base_url=base_url)
+            raw = cl.chat_vision(
                 model=m_model,
                 system=p_sys,
                 user_text=p_user,
@@ -207,18 +233,57 @@ def run_vlm_text_only(
                 subdir=subdir,
                 extra=extra,
             )
-            manifest_rows.append(row)
-            if on_page_done is not None:
-                on_page_done(i, len(images))
+            if cancel_event is not None and cancel_event.is_set():
+                return (i, None, True)
             _log.debug(
                 "vlm 分段 segment_count=%s char_count=%s",
                 row.get("segment_count"),
                 row.get("char_count"),
             )
-            if cancel_event is not None and cancel_event.is_set():
-                _log.info("vlm-text 在页 %s 之后被用户取消/结束，已写 %s 页", page_id, len(manifest_rows))
+            return (i, row, False)
+
+        if max_workers <= 1:
+            for i, img_path in enumerate(images, start=1):
+                idx, row, aborted = _run_one(i, img_path)
+                if row is None and aborted:
+                    cancelled = True
+                    _log.info("vlm-text 在序号 %s 前中止", i)
+                    break
+                if row is not None:
+                    manifest_rows.append(row)
+                if on_page_done is not None:
+                    on_page_done(i, n_img)
+                if cancel_event is not None and cancel_event.is_set() and row is not None:
+                    cancelled = True
+                    _log.info("vlm-text 在页完成后检测到取消，已写 %s 页", len(manifest_rows))
+                    break
+        else:
+            indexed: list[tuple[int, dict[str, Any]]] = []
+            with ThreadPoolExecutor(max_workers=max_workers) as ex:
+                pending: dict[Any, int] = {
+                    ex.submit(_run_one, i, p): i
+                    for i, p in enumerate(images, start=1)
+                }
+                try:
+                    for fut in as_completed(pending):
+                        try:
+                            _idx, row, _ab = fut.result()
+                        except Exception:  # noqa: BLE001
+                            ex.shutdown(wait=False, cancel_futures=True)
+                            raise
+                        if row is not None:
+                            indexed.append((_idx, row))
+                        if on_page_done is not None:
+                            with _prog_lock:
+                                _n_done += 1
+                                c = _n_done
+                            on_page_done(c, n_img)
+                except Exception:  # noqa: BLE001
+                    raise
+            manifest_rows = [r for _i, r in sorted(indexed, key=lambda t: t[0])]
+            if len(manifest_rows) < n_img and cancel_event is not None and cancel_event.is_set():
                 cancelled = True
-                break
+                _log.info("vlm-text 因取消/中止，已收齐 %s/%s 页", len(manifest_rows), n_img)
 
     man_path = write_page_text_manifest(out, subdir, manifest_name, manifest_rows)
     _log.info("已写入 manifest: %s", man_path)

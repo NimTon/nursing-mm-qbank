@@ -7,12 +7,12 @@
 ```bash
 pip install -U pip
 pip install -e .
-# 需 OpenAI 兼容网关与多模态+文本模型（见 .env.example）
+# 需 OpenAI 兼容网关；在 .env 中配置 VLM_* 与 LLM_*（见 .env.example）
 ```
 
 ## 配置
 
-- 项目根目录 **`.env`**：API 密钥、兼容接口地址、文本/多模态模型名。  
+- 项目根目录 **`.env`**：整页读图用 **`VLM_BASE_URL` + `VLM_API_KEY`**（及可选 `VLM_MODEL`）；拆题与教材向修正用 **`LLM_BASE_URL` + `LLM_API_KEY`**（及可选 `LLM_MODEL`），可与 VLM 不同服务。见 `.env.example`。
 - **`configs/default.yaml`**：预处理 `preprocess`（VLM 读图前用）、`vlm`、`llm`（拆题温度）、`refine`（修正步温度与 **`web_search` 是否希望走联网**；类 DashScope 在部分线路上会附加联网请求头，**是否真正联网**以你控制台与官方文档为准）。
 
 ## 主流程

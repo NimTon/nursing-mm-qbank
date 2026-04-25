@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, cast
 
-from mm_qbank.config import load_config, project_root, text_llm_settings
+from mm_qbank.config import load_config, llm_text_settings, project_root
 from mm_qbank.io.xlsx_out import write_refined_rows_to_xlsx
 from mm_qbank.llm.client import OpenAICompatClient
 from mm_qbank.llm.jsonutil import parse_json_object
@@ -15,6 +17,15 @@ from mm_qbank.pipeline.vlm_merge import merge_vlm_items_by_tihao
 from mm_qbank.prompts_loader import refine_system, refine_user_payload
 
 _log = logging.getLogger(__name__)
+
+
+def _cap_workers(n_tasks: int, raw: Any) -> int:
+    if raw is None or (isinstance(raw, str) and not str(raw).strip()):
+        w = min(8, (os.cpu_count() or 4) * 2)
+    else:
+        w = int(raw)
+    w = max(1, w)
+    return min(w, max(1, n_tasks))
 
 
 def _read_json(path: Path) -> dict[str, Any]:
@@ -87,11 +98,9 @@ def run_refine_vlm_merged(
     输出修正字段，汇总为行列表并写 ``out_jsonl`` 与 **xlsx**（每行一题一记录）。
     """
     cfg = load_config(config_path)
-    tl = text_llm_settings()
+    tl = llm_text_settings()
     if not tl.get("api_key"):
-        raise ValueError(
-            "未配置文本 LLM 密钥：OPENAI / DASHSCOPE，或与百炼并存时 DEEPSEEK_API_KEY / TEXT_LLM_*，见 config.text_llm_settings"
-        )
+        raise ValueError("未配置 LLM_API_KEY：请在 .env 中设置 LLM_BASE_URL 与 LLM_API_KEY")
     rcfg = dict(cfg.get("refine") or {})
     text_model = (model or "").strip() or str(
         (rcfg.get("model") or tl.get("text_model") or "gpt-4o-mini")
@@ -111,13 +120,8 @@ def run_refine_vlm_merged(
     default_headers: dict[str, str] | None = None
     burl = (tl.get("base_url") or "") or ""
     if web_search and "dashscope" in burl.lower():
-        # 百炼/灵积 OpenAI 兼容在部分线路上支持该头触发联网，是否生效以你控制台与文档为准
+        # 部分 OpenAI 兼容网关在部分线路上支持该头触发联网，是否生效以供应商文档为准
         default_headers = {"X-DashScope-Enable-Internet-Search": "enable"}
-    client = OpenAICompatClient(
-        api_key=str(tl.get("api_key")),
-        base_url=tl.get("base_url") or None,
-        default_headers=default_headers,
-    )
 
     root = project_root()
     out_dir = (out_jsonl.parent if out_jsonl else (root / "data" / "out" / "refine")).resolve()
@@ -197,20 +201,29 @@ def run_refine_vlm_merged(
     else:
         rsys = refine_system()
         total = len(merged_all)
-        for bi in range(0, total, batch_size):
+        n_batches = (total + batch_size - 1) // batch_size
+        max_rw = _cap_workers(n_batches, rcfg.get("max_workers"))
+        _log.info("vlm-refine 题块批次数=%s，并行：max_workers=%s", n_batches, max_rw)
+
+        def _refine_one_start(bi: int) -> tuple[int, list[dict[str, Any]]]:
             chunk = merged_all[bi : bi + batch_size]
             chunk_simple = [{"题号": x["题号"], "问题": x["问题"], "解析": x["解析"]} for x in chunk]
             up = refine_user_payload(
                 page_id=f"跨页合并 {bi//batch_size + 1}", merged=chunk_simple, web_search=web_search
             )
+            c = OpenAICompatClient(
+                api_key=str(tl.get("api_key")),
+                base_url=tl.get("base_url") or None,
+                default_headers=default_headers,
+            )
             _log.info(
                 "[%s/%s] 跨页合并题块 %s 条，请求修正模型",
                 (bi // batch_size) + 1,
-                (total + batch_size - 1) // batch_size,
+                n_batches,
                 len(chunk_simple),
             )
             try:
-                content = client.chat_text_json(
+                content = c.chat_text_json(
                     model=text_model,
                     messages=[
                         {"role": "system", "content": rsys},
@@ -220,7 +233,7 @@ def run_refine_vlm_merged(
                     timeout=timeout,
                 )
             except Exception:  # noqa: BLE001
-                content = client.chat_text_json(
+                content = c.chat_text_json(
                     model=text_model,
                     messages=[
                         {"role": "system", "content": rsys},
@@ -230,6 +243,7 @@ def run_refine_vlm_merged(
                     timeout=None,
                 )
             out_items = _parse_refine_response(content)
+            flat_part: list[dict[str, Any]] = []
             for j, m in enumerate(chunk_simple):
                 oi: dict[str, Any] = out_items[j] if j < len(out_items) else {}
                 row = _normalize_out_item(m, oi)
@@ -237,7 +251,22 @@ def run_refine_vlm_merged(
                 row["page_id"] = ",".join(meta.get("page_ids") or [])
                 imgs = meta.get("source_images") or []
                 row["source_image"] = imgs[0] if imgs else ""
-                flat.append(row)
+                flat_part.append(row)
+            return (bi, flat_part)
+
+        starts = list(range(0, total, batch_size))
+        if max_rw <= 1 or len(starts) <= 1:
+            for st in starts:
+                _, part = _refine_one_start(st)
+                flat.extend(part)
+        else:
+            with ThreadPoolExecutor(max_workers=max_rw) as ex:
+                futs = [ex.submit(_refine_one_start, st) for st in starts]
+                parts: list[tuple[int, list[dict[str, Any]]]] = []
+                for fut in as_completed(futs):
+                    parts.append(fut.result())
+            for st, part in sorted(parts, key=lambda t: t[0]):
+                flat.extend(part)
 
     if not flat:
         _log.warning("无输出记录")

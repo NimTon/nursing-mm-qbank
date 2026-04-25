@@ -17,86 +17,33 @@ def project_root() -> Path:
     return Path(__file__).resolve().parents[2]
 
 
-def _is_dashscope_compatible_base_url(base_url: str | None) -> bool:
-    u = (base_url or "").lower()
-    return "dashscope" in u
-
-
-def _is_deepseek_base_url(base_url: str | None) -> bool:
-    u = (base_url or "").lower()
-    return "deepseek.com" in u
-
-
-def _default_models_for_base_url(base_url: str | None) -> tuple[str, str]:
-    if _is_dashscope_compatible_base_url(base_url):
-        return ("qwen-plus", "qwen-vl-plus")
-    # OpenAI 兼容，见 https://api-docs.deepseek.com/zh-cn/
-    if _is_deepseek_base_url(base_url):
-        return ("deepseek-v4-pro", "deepseek-v4-pro")
-    return ("gpt-4o-mini", "gpt-4o")
-
-
-def openai_settings() -> dict[str, str | None]:
-    base_url = os.getenv("OPENAI_BASE_URL")
-    key_openai = os.getenv("OPENAI_API_KEY")
-    key_dash = os.getenv("DASHSCOPE_API_KEY")
-    key_deepseek = os.getenv("DEEPSEEK_API_KEY")
-    if _is_deepseek_base_url(base_url):
-        # 见 https://api-docs.deepseek.com/zh-cn/ — 可单独用 DEEPSEEK_API_KEY，与百炼的 OPENAI_API_KEY 同时存在时以本项优先
-        api_key = key_deepseek or key_openai or key_dash
-    else:
-        api_key = key_openai or key_dash
-    dt, dmm = _default_models_for_base_url(base_url)
-    text_model = os.getenv("OPENAI_TEXT_MODEL") or dt
-    final_model = os.getenv("OPENAI_FINAL_PROOFREAD_MODEL") or text_model
-    mm_model = os.getenv("OPENAI_MM_MODEL") or dmm
+def vlm_settings() -> dict[str, str | None]:
+    """
+    多模态 VLM 网关：``VLM_BASE_URL``、``VLM_API_KEY``、``VLM_MODEL``（未设模型时默认 ``gpt-4o``）。
+    """
+    b = (os.getenv("VLM_BASE_URL") or "").strip()
+    k = (os.getenv("VLM_API_KEY") or "").strip()
+    mm = (os.getenv("VLM_MODEL") or "").strip() or "gpt-4o"
     return {
-        "api_key": api_key,
-        "base_url": base_url,
-        "text_model": text_model,
-        "final_model": final_model,
-        "mm_model": mm_model,
+        "api_key": k or None,
+        "base_url": b or None,
+        "mm_model": mm,
     }
 
 
-def text_llm_settings() -> dict[str, str | None]:
+def llm_text_settings() -> dict[str, str | None]:
     """
-    纯文本 LLM（llm-compose、vlm-refine）的网关，可与多模态主网关分离。
+    纯文本 LLM：``LLM_BASE_URL``、``LLM_API_KEY``、``LLM_MODEL``（未设模型时默认 ``gpt-4o-mini``）。
 
-    1) 若同时设置 ``TEXT_LLM_BASE_URL`` 与 ``TEXT_LLM_API_KEY`` → 文本专用（可指向 DeepSeek 等）。
-    2) 否则若主 ``OPENAI_BASE_URL`` 非 DeepSeek 且设置了 ``DEEPSEEK_API_KEY`` → 文本默认走
-       ``TEXT_LLM_BASE_URL`` / ``DEEPSEEK_BASE_URL`` / ``https://api.deepseek.com`` + 该 key
-       （典型：VLM 走百炼 Qwen，拆题/修正走 DeepSeek）。
-    3) 否则与 ``openai_settings()`` 相同（同一 key/base）。
-    文本模型名优先 ``TEXT_LLM_MODEL``；在 2) 且未设时默认 ``deepseek-v4-flash``（更省）。
+    用于 llm-compose、vlm-refine。
     """
-    oa = openai_settings()
-    k_txt = os.getenv("TEXT_LLM_API_KEY")
-    b_txt = os.getenv("TEXT_LLM_BASE_URL")
-    if k_txt and b_txt:
-        m_env = os.getenv("TEXT_LLM_MODEL")
-        if m_env:
-            m = m_env.strip()
-        elif _is_deepseek_base_url(b_txt):
-            m = "deepseek-v4-flash"
-        else:
-            m = str(oa.get("text_model") or "gpt-4o-mini")
-        return {"api_key": k_txt.strip(), "base_url": b_txt.strip(), "text_model": m}
-
-    k_ds = os.getenv("DEEPSEEK_API_KEY")
-    if k_ds and not _is_deepseek_base_url(oa.get("base_url")):
-        base = (
-            os.getenv("TEXT_LLM_BASE_URL")
-            or os.getenv("DEEPSEEK_BASE_URL")
-            or "https://api.deepseek.com"
-        ).strip()
-        m = (os.getenv("TEXT_LLM_MODEL") or "deepseek-v4-flash").strip()
-        return {"api_key": k_ds.strip(), "base_url": base, "text_model": m}
-
+    b = (os.getenv("LLM_BASE_URL") or "").strip()
+    k = (os.getenv("LLM_API_KEY") or "").strip()
+    m = (os.getenv("LLM_MODEL") or "").strip() or "gpt-4o-mini"
     return {
-        "api_key": oa.get("api_key"),
-        "base_url": oa.get("base_url"),
-        "text_model": str(oa.get("text_model") or "gpt-4o-mini"),
+        "api_key": k or None,
+        "base_url": b or None,
+        "text_model": m,
     }
 
 

@@ -35,7 +35,7 @@ from dotenv import load_dotenv
 from PIL import Image, ImageTk
 
 from mm_qbank import __version__
-from mm_qbank.config import project_root
+from mm_qbank.config import llm_text_settings, project_root, vlm_settings
 from mm_qbank.logging_utils import configure_logging
 from mm_qbank.pipeline.llm_compose_run import run_llm_compose_manifest
 from mm_qbank.pipeline.refine_vlm_run import run_refine_vlm_merged
@@ -335,67 +335,89 @@ def main() -> None:
     btn_dir["command"] = on_pick_dir
     btn_files["command"] = on_pick_files
 
-    # --- API 密钥（写入项目根 .env；留空不修改该项）
+    # --- VLM / LLM 网关（写入项目根 .env；留空不修改该项）
     env_path = project_root() / ".env"
-    fr_key = ttk.LabelFrame(content, text="API 密钥（VLM 主网关 + 文本 LLM / DeepSeek）", padding=8)
+    fr_key = ttk.LabelFrame(content, text="API：VLM（整页读图）与 LLM（拆题 / 修正）", padding=8)
     fr_key.pack(fill=tk.X, padx=8, pady=4)
     gf = ttk.Frame(fr_key)
     gf.pack(fill=tk.X)
-    ttk.Label(gf, text="OPENAI_API_KEY（百炼等，用于 VLM）").grid(row=0, column=0, sticky=tk.W, pady=(0, 2))
-    ent_openai = ttk.Entry(gf, width=72, show="*")
-    ent_openai.grid(row=1, column=0, sticky=tk.EW, pady=(0, 4))
-    lbl_mk = ttk.Label(gf, text="", foreground="#666", font=("", 8))
-    lbl_mk.grid(row=2, column=0, sticky=tk.W, pady=(0, 6))
-    ttk.Label(gf, text="DEEPSEEK_API_KEY（用于 llm-compose / vlm-refine，可与上并存）").grid(
-        row=3, column=0, sticky=tk.W, pady=(0, 2)
+    ttk.Label(gf, text="VLM 接口地址 (VLM_BASE_URL，可含 /v1)").grid(
+        row=0, column=0, sticky=tk.W, pady=(0, 2)
     )
-    ent_deepseek = ttk.Entry(gf, width=72, show="*")
-    ent_deepseek.grid(row=4, column=0, sticky=tk.EW, pady=(0, 4))
-    lbl_dk = ttk.Label(gf, text="", foreground="#666", font=("", 8))
-    lbl_dk.grid(row=5, column=0, sticky=tk.W, pady=(0, 4))
+    ent_vlm_base = ttk.Entry(gf, width=72)
+    ent_vlm_base.grid(row=1, column=0, sticky=tk.EW, pady=(0, 2))
+    ttk.Label(gf, text="VLM API 密钥 (VLM_API_KEY)").grid(row=2, column=0, sticky=tk.W, pady=(0, 2))
+    ent_vlm_key = ttk.Entry(gf, width=72, show="*")
+    ent_vlm_key.grid(row=3, column=0, sticky=tk.EW, pady=(0, 4))
+    lbl_vlm = ttk.Label(gf, text="", foreground="#666", font=("", 8))
+    lbl_vlm.grid(row=4, column=0, sticky=tk.W, pady=(0, 6))
+    ttk.Label(gf, text="LLM 接口地址 (LLM_BASE_URL) — 与 VLM 可不同").grid(
+        row=5, column=0, sticky=tk.W, pady=(0, 2)
+    )
+    ent_llm_base = ttk.Entry(gf, width=72)
+    ent_llm_base.grid(row=6, column=0, sticky=tk.EW, pady=(0, 2))
+    ttk.Label(gf, text="LLM API 密钥 (LLM_API_KEY)").grid(row=7, column=0, sticky=tk.W, pady=(0, 2))
+    ent_llm_key = ttk.Entry(gf, width=72, show="*")
+    ent_llm_key.grid(row=8, column=0, sticky=tk.EW, pady=(0, 4))
+    lbl_llm = ttk.Label(gf, text="", foreground="#666", font=("", 8))
+    lbl_llm.grid(row=9, column=0, sticky=tk.W, pady=(0, 4))
     gf.columnconfigure(0, weight=1)
     fr_key_btns = ttk.Frame(fr_key)
     fr_key_btns.pack(fill=tk.X)
-    btn_save_keys = ttk.Button(fr_key_btns, text="保存密钥到 .env")
+    btn_save_keys = ttk.Button(fr_key_btns, text="保存到 .env")
     btn_save_keys.pack(side=tk.LEFT)
 
     def _refresh_key_status() -> None:
         load_dotenv(env_path, override=True)
-        mo = bool((os.getenv("OPENAI_API_KEY") or "").strip())
-        dd = bool((os.getenv("DEEPSEEK_API_KEY") or "").strip())
-        lbl_mk.config(
-            text=f"当前进程：{'已' if mo else '未'}读取到 OPENAI_API_KEY（输入新值后保存会写入 .env）",
-            foreground=("#060" if mo else "#a60"),
+        vs = vlm_settings()
+        ls = llm_text_settings()
+        v_ok = bool((vs.get("api_key") or "").strip())
+        l_ok = bool((ls.get("api_key") or "").strip())
+        vb = bool((vs.get("base_url") or "").strip())
+        lb = bool((ls.get("base_url") or "").strip())
+        lbl_vlm.config(
+            text=f"当前进程 VLM：{'已' if v_ok else '未'}配置密钥，{'已' if vb else '未'}设 VLM_BASE_URL",
+            foreground=("#060" if v_ok else "#a60"),
         )
-        lbl_dk.config(
-            text=f"当前进程：{'已' if dd else '未'}读取到 DEEPSEEK_API_KEY",
-            foreground=("#060" if dd else "#a60"),
+        lbl_llm.config(
+            text=f"当前进程 LLM：{'已' if l_ok else '未'}配置密钥，{'已' if lb else '未'}设 LLM_BASE_URL",
+            foreground=("#060" if l_ok else "#a60"),
         )
 
     def on_save_keys() -> None:
-        oa_val = ent_openai.get().strip()
-        ds_val = ent_deepseek.get().strip()
-        if not oa_val and not ds_val:
-            messagebox.showinfo("提示", "两项均为空，未修改 .env。填写至少一项后再保存。")
+        vb = ent_vlm_base.get().strip()
+        vk = ent_vlm_key.get().strip()
+        lb = ent_llm_base.get().strip()
+        lk = ent_llm_key.get().strip()
+        if not (vb or vk or lb or lk):
+            messagebox.showinfo("提示", "四个框均为空，未修改 .env。至少填一项后保存，或手编项目根 .env。")
             return
         try:
             body = env_path.read_text(encoding="utf-8") if env_path.is_file() else ""
-            if oa_val:
-                body = _upsert_env_line(body, "OPENAI_API_KEY", oa_val)
-            if ds_val:
-                body = _upsert_env_line(body, "DEEPSEEK_API_KEY", ds_val)
+            if vb:
+                body = _upsert_env_line(body, "VLM_BASE_URL", vb)
+            if vk:
+                body = _upsert_env_line(body, "VLM_API_KEY", vk)
+            if lb:
+                body = _upsert_env_line(body, "LLM_BASE_URL", lb)
+            if lk:
+                body = _upsert_env_line(body, "LLM_API_KEY", lk)
             env_path.parent.mkdir(parents=True, exist_ok=True)
             env_path.write_text(body, encoding="utf-8")
         except OSError as e:
             messagebox.showerror("写入失败", str(e))
             return
         load_dotenv(env_path, override=True)
-        if oa_val:
-            os.environ["OPENAI_API_KEY"] = oa_val
-        if ds_val:
-            os.environ["DEEPSEEK_API_KEY"] = ds_val
-        ent_openai.delete(0, tk.END)
-        ent_deepseek.delete(0, tk.END)
+        if vb:
+            os.environ["VLM_BASE_URL"] = vb
+        if vk:
+            os.environ["VLM_API_KEY"] = vk
+        if lb:
+            os.environ["LLM_BASE_URL"] = lb
+        if lk:
+            os.environ["LLM_API_KEY"] = lk
+        for w in (ent_vlm_base, ent_vlm_key, ent_llm_base, ent_llm_key):
+            w.delete(0, tk.END)
         _refresh_key_status()
         messagebox.showinfo("已保存", f"已写入: {env_path.resolve()}\n当前进程环境已刷新，可直接点「开始」。")
 
@@ -436,7 +458,7 @@ def main() -> None:
         log_t.config(state=tk.DISABLED)
 
     log_t.pack(fill=tk.BOTH, expand=True)
-    _append_t("将 mm-qbank 的日志显示在此处；需配置项目根 .env 的 API Key 与多模态模型。\n\n")
+    _append_t("将 mm-qbank 的日志显示在此处；请在项目根 .env 中配置 VLM/LLM 的 base URL 与 API 密钥（或见兼容旧名）。\n\n")
 
     def poll_q() -> None:
         if _LOG_QUEUE is None:
@@ -470,8 +492,10 @@ def main() -> None:
     def _set_input_buttons(state: str) -> None:
         btn_dir["state"] = state
         btn_files["state"] = state
-        ent_openai["state"] = state
-        ent_deepseek["state"] = state
+        ent_vlm_base["state"] = state
+        ent_vlm_key["state"] = state
+        ent_llm_base["state"] = state
+        ent_llm_key["state"] = state
         btn_save_keys["state"] = state
 
     def _set_run_buttons(*, working: bool, paused: bool) -> None:
@@ -510,8 +534,8 @@ def main() -> None:
 
         st_lbl.config(
             text=(
-                f"待处理 {n} 张 · 总进度 0%（0–50% VLM，50–100% LLM 拆题；"
-                f"拆题后自动跑修正并写 refined_merged.xlsx，单页请求中不暂停/结束，页间可）"
+                f"待处理 {n} 张 · 0%（0–50% 多图并行 VLM，50–100% 多页并行拆题；"
+                f"拆题后教材修正；单页/单次请求不暂停/结束，页与页之间可）"
             )
         )
         _set_input_buttons(tk.DISABLED)

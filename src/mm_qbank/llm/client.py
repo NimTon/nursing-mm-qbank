@@ -16,7 +16,7 @@ class OpenAICompatClient:
         default_headers: dict[str, str] | None = None,
     ) -> None:
         if not api_key:
-            raise ValueError("缺少 API 密钥，请在 .env 中配置 OPENAI / DASHSCOPE /（DeepSeek 的）DEEPSEEK 等，见项目说明")
+            raise ValueError("缺少 API 密钥：多模态使用 VLM_API_KEY，纯文本使用 LLM_API_KEY（见 .env.example）")
         kw: dict[str, Any] = {"api_key": api_key, "base_url": base_url, "timeout": timeout}
         if default_headers:
             kw["default_headers"] = default_headers
@@ -58,7 +58,7 @@ class OpenAICompatClient:
         response_format_json: bool = False,
     ) -> str:
         """
-        多模态：单张图片 + 文本。使用 ``data:`` URL 编码，便于兼容类 OpenAI 的国产网关、DashScope 等。
+        多模态：单张图片 + 文本。使用 ``data:`` URL 编码，便于 OpenAI 兼容类网关。
 
         注意：模型须支持视觉；费用与图尺寸、调用量相关，建议配合预处理限制长边。
         ``response_format_json=True`` 时尽量请求单 JSON 对象；若网关不支持会退回无该参数的请求。

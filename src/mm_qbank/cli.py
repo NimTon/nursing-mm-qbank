@@ -43,7 +43,7 @@ def main() -> None:
         dest="mm_model",
         type=str,
         default=None,
-        help="覆盖多模态模型名（缺省为配置 vlm.model 或环境变量 OPENAI_MM_MODEL）",
+        help="覆盖多模态模型名（缺省为配置 vlm.model 或环境变量 VLM_MODEL）",
     )
 
     refine = sub.add_parser(
@@ -78,7 +78,7 @@ def main() -> None:
         dest="refine_model",
         type=str,
         default=None,
-        help="覆盖 refine.model 或 OPENAI_TEXT_MODEL",
+        help="覆盖 refine.model 或环境变量 LLM_MODEL",
     )
 
     llm = sub.add_parser(
@@ -95,7 +95,7 @@ def main() -> None:
     )
     llm.add_argument("--out", dest="out_jsonl", type=Path, required=True, help="输出每页一行 JSON 的 .jsonl")
     llm.add_argument("--config", dest="config", type=Path, default=None, help="覆盖默认 configs/default.yaml")
-    llm.add_argument("--model", dest="model", type=str, default=None, help="覆盖 OPENAI_TEXT_MODEL")
+    llm.add_argument("--model", dest="model", type=str, default=None, help="覆盖环境变量 LLM_MODEL")
 
     args = parser.parse_args()
     configure_logging(verbose=bool(args.verbose), quiet=bool(args.quiet))
