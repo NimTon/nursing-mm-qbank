@@ -1,0 +1,36 @@
+# mm-qbank vlm-text：VLM 读图前可选本地预处理（缩放/纠偏/去阴影等）
+preprocess:
+  # 0 = 不缩小原图；正数 = 长边上限，例如 3000
+  max_long_edge: 0
+  tone_mode: raw
+  deskew:
+    enabled: true
+    max_abs_degrees: 20
+    min_abs_degrees: 0.35
+
+# 输出子路径：{out_dir}/{subdir}/{page_id}.* 与 pages.jsonl
+page_text:
+  subdir: pages
+  manifest: pages.jsonl
+
+# 多模态 VLM 整页转写（按次计费；未填 max_long_edge 时回退 preprocess.max_long_edge）
+vlm:
+  model: null
+  max_long_edge: 2000
+  use_preprocess: true
+  temperature: 0.1
+  timeout_seconds: 300.0
+
+# llm-compose：整页转写后按页拆题（可与 VLM 分网关：见 .env 的 DEEPSEEK_API_KEY / TEXT_LLM_*）
+llm:
+  # 未填则使用 text_llm_settings 的文本模型（与百炼并存时多为 deepseek-v4-pro）
+  model: null
+  temperature: 0.15
+
+# vlm-refine：按题号合并后教材向修正，并导 xlsx
+# web_search: true 时对类 DashScope 基址可附加联网请求头（以供应商为准）
+refine:
+  model: null
+  temperature: 0.2
+  web_search: false
+  timeout_seconds: 180.0

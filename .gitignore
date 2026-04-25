@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+dist/
+build/
+*.spec.bak
+
+# Virtual env
+venv/
+venv-*/
+
+# Env with secrets (use .env.example in repo)
+.env
+
+# Test / tools
+.pytest_cache/
+.coverage
+htmlcov/
+
+# IDE
+.idea/
+.vscode/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Local run outputs
+data/out/
+
+# Ad-hoc
+*.plan.md

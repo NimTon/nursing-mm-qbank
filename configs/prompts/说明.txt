@@ -1,0 +1,10 @@
+本目录为各阶段模型提示词（UTF-8 文本）。可在此修改后保存，重新运行程序即可生效，一般无需重打包。
+
+文件说明：
+- vlm_system.txt / vlm_user.txt         — 多模态 VLM 整页转写
+- llm_compose_system.txt / llm_compose_user.txt  — 文本拆题；用户模板中整页原文占位符为 __PAGE_PLAIN__
+- refine_system.txt / refine_example.txt / refine_user.txt  — 修正与导出；refine_user 中含占位 __REFINE_EXAMPLE__、__WEB_STATUS__、__PAGE_ID__、__MERGED_JSON__
+
+若某文件被删除，程序会回退到程序内置的默认提示词，并在日志中说明。
+
+Windows 若使用 PyInstaller 打包，请将需要修改的 txt 放在与 exe 同级的 configs\prompts\ 下（覆盖安装目录中同名文件即可）。

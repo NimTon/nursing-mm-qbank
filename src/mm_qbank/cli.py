@@ -1,0 +1,132 @@
+from __future__ import annotations
+
+import argparse
+import json
+import logging
+from pathlib import Path
+
+from mm_qbank.logging_utils import configure_logging
+from mm_qbank.pipeline.llm_compose_run import run_llm_compose_manifest
+from mm_qbank.pipeline.refine_vlm_run import run_refine_vlm_merged
+from mm_qbank.pipeline.vlm_text_run import run_vlm_text_only
+
+_log = logging.getLogger(__name__)
+
+
+def main() -> None:
+    parent = argparse.ArgumentParser(add_help=False)
+    parent.add_argument("-v", "--verbose", action="store_true", help="调试日志 (DEBUG)")
+    parent.add_argument("-q", "--quiet", action="store_true", help="仅警告与错误 (WARNING)")
+    parser = argparse.ArgumentParser(
+        prog="mm-qbank",
+        description="护理题库：VLM 整页转写（JSON 分类）→ 可选 vlm-refine 修正+导出 xlsx → 可选 llm-compose 拆题",
+        parents=[parent],
+    )
+    sub = parser.add_subparsers(dest="cmd", required=True)
+    # 将 parent 也挂到子命令上，否则子命令之后出现 -v/-q 会报 unrecognized
+    vlm = sub.add_parser(
+        "vlm-text",
+        parents=[parent],
+        help="多模态大模型整页转写，输出 .json + .txt + pages.jsonl",
+    )
+    vlm.add_argument("--in", dest="input_dir", type=Path, required=True, help="输入图片目录（递归扫描）")
+    vlm.add_argument(
+        "--out-dir",
+        dest="out_dir",
+        type=Path,
+        default=None,
+        help="输出根目录（默认：项目下 data/out/vlm_text）",
+    )
+    vlm.add_argument("--config", dest="config", type=Path, default=None, help="覆盖默认 configs/default.yaml")
+    vlm.add_argument(
+        "--model",
+        dest="mm_model",
+        type=str,
+        default=None,
+        help="覆盖多模态模型名（缺省为配置 vlm.model 或环境变量 OPENAI_MM_MODEL）",
+    )
+
+    refine = sub.add_parser(
+        "vlm-refine",
+        parents=[parent],
+        help="读 vlm-text 的 pages.jsonl（需 structured .json），按题号合并问题+解析，再 LLM 对照护理学教材修正，导出 xlsx+jsonl",
+    )
+    refine.add_argument(
+        "--manifest",
+        dest="refine_manifest",
+        type=Path,
+        required=True,
+        help="vlm-text 的 pages.jsonl 路径",
+    )
+    refine.add_argument(
+        "--out-jsonl",
+        dest="refine_jsonl",
+        type=Path,
+        default=None,
+        help="每题一行 JSON 的 jsonl（默认 data/out/refine/refined_merged.jsonl）",
+    )
+    refine.add_argument(
+        "--out-xlsx",
+        dest="refine_xlsx",
+        type=Path,
+        default=None,
+        help="Excel 表（默认 data/out/refine/refined_merged.xlsx）",
+    )
+    refine.add_argument("--config", dest="refine_config", type=Path, default=None, help="configs/default.yaml")
+    refine.add_argument(
+        "--model",
+        dest="refine_model",
+        type=str,
+        default=None,
+        help="覆盖 refine.model 或 OPENAI_TEXT_MODEL",
+    )
+
+    llm = sub.add_parser(
+        "llm-compose",
+        parents=[parent],
+        help="读取 pages.jsonl 与 .txt 整页文本，按页拆成结构化题目 JSONL",
+    )
+    llm.add_argument(
+        "--manifest",
+        dest="manifest",
+        type=Path,
+        required=True,
+        help="vlm-text 的 pages.jsonl 路径，如 data/out/vlm_text/pages/pages.jsonl",
+    )
+    llm.add_argument("--out", dest="out_jsonl", type=Path, required=True, help="输出每页一行 JSON 的 .jsonl")
+    llm.add_argument("--config", dest="config", type=Path, default=None, help="覆盖默认 configs/default.yaml")
+    llm.add_argument("--model", dest="model", type=str, default=None, help="覆盖 OPENAI_TEXT_MODEL")
+
+    args = parser.parse_args()
+    configure_logging(verbose=bool(args.verbose), quiet=bool(args.quiet))
+    _log.info("子命令: %s", args.cmd)
+
+    if args.cmd == "vlm-text":
+        summary = run_vlm_text_only(
+            input_dir=args.input_dir,
+            out_dir=args.out_dir,
+            config_path=args.config,
+            model=args.mm_model,
+        )
+        print(json.dumps(summary, ensure_ascii=False, indent=2))
+    elif args.cmd == "vlm-refine":
+        summary = run_refine_vlm_merged(
+            manifest_path=args.refine_manifest,
+            out_jsonl=args.refine_jsonl,
+            out_xlsx=args.refine_xlsx,
+            config_path=args.refine_config,
+            model=args.refine_model,
+        )
+        print(json.dumps(summary, ensure_ascii=False, indent=2))
+    elif args.cmd == "llm-compose":
+        summary = run_llm_compose_manifest(
+            manifest_path=args.manifest,
+            out_jsonl=args.out_jsonl,
+            config_path=args.config,
+            model=args.model,
+        )
+        print(json.dumps(summary, ensure_ascii=False, indent=2))
+
+
+if __name__ == "__main__":
+    main()
