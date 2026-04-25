@@ -30,5 +30,11 @@ Thumbs.db
 # Local run outputs
 data/out/
 
+# Large local datasets / model artifacts (do not commit)
+data/inbound/
+data/rag/
+models/
+nursing_textbook/
+
 # Ad-hoc
 *.plan.md

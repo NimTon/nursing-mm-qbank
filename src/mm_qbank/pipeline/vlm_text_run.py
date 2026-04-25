@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import os
+import json
 import tempfile
 import threading
 import time
@@ -15,6 +16,7 @@ from mm_qbank.config import load_config, project_root, vlm_settings
 from mm_qbank.prompts_loader import get_prompt
 from mm_qbank.layout_postprocess.page_text import export_vlm_classified_artifact, write_page_text_manifest
 from mm_qbank.llm.client import OpenAICompatClient
+from mm_qbank.llm.retry import call_with_retries_timeout
 from mm_qbank.llm.jsonutil import parse_json_object
 from mm_qbank.pipeline.scan_pages import list_input_images, page_id_for
 from mm_qbank.preprocess.image import preprocess_image
@@ -136,6 +138,10 @@ def run_vlm_text_only(
     cancel_event: threading.Event | None = None,
     paused: Callable[[], bool] | None = None,
     on_page_done: Callable[[int, int], None] | None = None,
+    on_page_result: Callable[
+        [int, int, str, Path, list[dict[str, Any]], dict[str, Any] | None, dict[str, Any]], None
+    ]
+    | None = None,
 ) -> dict[str, Any]:
     """
     多模态整页转写为 JSON 分类项（`题号` + `问题`/`解析` + `内容`）及合并 `.txt`；
@@ -189,6 +195,38 @@ def run_vlm_text_only(
 
     manifest_rows: list[dict[str, Any]] = []
     cancelled = False
+    # 流式写 manifest：每页完成就落盘，防止中途卡死/中断丢失
+    man_path = (out / subdir / manifest_name).resolve()
+    man_path.parent.mkdir(parents=True, exist_ok=True)
+    # 每次运行默认覆写，避免与旧内容混杂；若要断点续跑可再扩展为 append+去重
+    man_f = man_path.open("w", encoding="utf-8", newline="")
+    _man_lock = threading.Lock()
+    _pending_rows: dict[int, dict[str, Any]] = {}
+    _next_write_idx = 1
+
+    def _stream_manifest_row(idx: int, row: dict[str, Any]) -> None:
+        nonlocal _next_write_idx
+        with _man_lock:
+            _pending_rows[idx] = row
+            while _next_write_idx in _pending_rows:
+                r = _pending_rows.pop(_next_write_idx)
+                man_f.write(json.dumps(r, ensure_ascii=False) + "\n")
+                man_f.flush()
+                try:
+                    os.fsync(man_f.fileno())
+                except OSError:
+                    # 某些文件系统/环境可能不支持；flush 已足够保证大部分场景的可恢复性
+                    pass
+                manifest_rows.append(r)
+                _log.info(
+                    "vlm-text stream-saved [%s/%s] page_id=%s -> %s",
+                    _next_write_idx,
+                    n_img,
+                    r.get("page_id", ""),
+                    str(man_path),
+                )
+                _next_write_idx += 1
+
     with tempfile.TemporaryDirectory(prefix="mm_qbank_vlm_") as tmp:
         tdir = Path(tmp)
         _prog_lock = threading.Lock()
@@ -210,6 +248,9 @@ def run_vlm_text_only(
                     max_long_edge=max_long_edge,
                     deskew=pre_cfg.get("deskew"),
                     tone_mode=str(pre_cfg.get("tone_mode", "shaded")),
+                    rotate_degrees=float(pre_cfg.get("rotate_degrees", 0.0) or 0.0),
+                    auto_exif=bool(pre_cfg.get("auto_exif", True)),
+                    auto_rotate=bool(pre_cfg.get("auto_rotate", False)),
                 )
                 body = pre_path.read_bytes()
                 ctyp = "image/png"
@@ -219,15 +260,29 @@ def run_vlm_text_only(
             if cancel_event is not None and cancel_event.is_set():
                 return (i, None, True)
             cl = OpenAICompatClient(api_key=api_key, base_url=base_url)
-            raw = cl.chat_vision(
-                model=m_model,
-                system=p_sys,
-                user_text=p_user,
-                image_bytes=body,
-                content_type=ctyp,
-                temperature=temp,
-                timeout=timeout,
-                response_format_json=True,
+            raw = call_with_retries_timeout(
+                lambda t: cl.chat_vision(
+                    model=m_model,
+                    system=p_sys,
+                    user_text=p_user,
+                    image_bytes=body,
+                    content_type=ctyp,
+                    temperature=temp,
+                    timeout=float(t),
+                    response_format_json=True,
+                ),
+                tries=3,
+                base_timeout_s=float(timeout),
+                base_sleep_s=1.0,
+                on_retry=lambda att, e, s, nt: _log.warning(
+                    "VLM HTTP 失败将重试 page_id=%s attempt=%s/3 sleep=%.2fs next_timeout=%.1fs err=%s: %s",
+                    page_id,
+                    att + 1,
+                    s,
+                    nt,
+                    type(e).__name__,
+                    e,
+                ),
             )
             items, extra = _parse_vlm_response(raw)
             if extra:
@@ -247,6 +302,11 @@ def run_vlm_text_only(
                 subdir=subdir,
                 extra=extra,
             )
+            if on_page_result is not None:
+                try:
+                    on_page_result(i, n_img, page_id, img_path, items, extra, row)
+                except Exception as e:  # noqa: BLE001
+                    _log.warning("on_page_result 回调失败 page_id=%s: %s", page_id, e)
             if cancel_event is not None and cancel_event.is_set():
                 return (i, None, True)
             _log.debug(
@@ -264,7 +324,7 @@ def run_vlm_text_only(
                     _log.info("vlm-text 在序号 %s 前中止", i)
                     break
                 if row is not None:
-                    manifest_rows.append(row)
+                    _stream_manifest_row(idx, row)
                 if on_page_done is not None:
                     on_page_done(i, n_img)
                 if cancel_event is not None and cancel_event.is_set() and row is not None:
@@ -272,7 +332,6 @@ def run_vlm_text_only(
                     _log.info("vlm-text 在页完成后检测到取消，已写 %s 页", len(manifest_rows))
                     break
         else:
-            indexed: list[tuple[int, dict[str, Any]]] = []
             with ThreadPoolExecutor(max_workers=max_workers) as ex:
                 pending: dict[Any, int] = {
                     ex.submit(_run_one, i, p): i
@@ -286,7 +345,7 @@ def run_vlm_text_only(
                             ex.shutdown(wait=False, cancel_futures=True)
                             raise
                         if row is not None:
-                            indexed.append((_idx, row))
+                            _stream_manifest_row(_idx, row)
                         if on_page_done is not None:
                             with _prog_lock:
                                 _n_done += 1
@@ -294,20 +353,24 @@ def run_vlm_text_only(
                             on_page_done(c, n_img)
                 except Exception:  # noqa: BLE001
                     raise
-            manifest_rows = [r for _i, r in sorted(indexed, key=lambda t: t[0])]
             if len(manifest_rows) < n_img and cancel_event is not None and cancel_event.is_set():
                 cancelled = True
                 _log.info("vlm-text 因取消/中止，已收齐 %s/%s 页", len(manifest_rows), n_img)
 
-    man_path = write_page_text_manifest(out, subdir, manifest_name, manifest_rows)
-    _log.info("已写入 manifest: %s", man_path)
+    try:
+        man_f.close()
+    except OSError:
+        pass
+    # 正常结束后再次覆写一遍（保证完整性/顺序一致）；若中途卡死/崩溃，流式文件也已包含已完成页
+    final_man_path = write_page_text_manifest(out, subdir, manifest_name, manifest_rows)
+    _log.info("已写入 manifest: %s", final_man_path or man_path)
     return {
         "mode": "vlm",
         "out_dir": str(out),
         "n_pages": len(manifest_rows) if cancelled else len(images),
         "n_total_images": len(images),
         "page_ids": [r["page_id"] for r in manifest_rows],
-        "manifest": str(man_path) if man_path else None,
+        "manifest": str(final_man_path or man_path),
         "model": m_model,
         "cancelled": cancelled,
     }

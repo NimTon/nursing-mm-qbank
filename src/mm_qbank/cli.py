@@ -7,8 +7,10 @@ from pathlib import Path
 
 from mm_qbank.api_verify import run_verify
 from mm_qbank.logging_utils import configure_logging
+from mm_qbank.kb.kb_build import build_kb_from_pdf_dir
+from mm_qbank.kb.kb_store import kb_dir_from_arg, load_kb
 from mm_qbank.pipeline.llm_compose_run import run_llm_compose_manifest
-from mm_qbank.pipeline.refine_vlm_run import run_refine_vlm_merged
+from mm_qbank.pipeline.refine_vlm_run import run_refine_from_compose_jsonl, run_refine_vlm_merged
 from mm_qbank.pipeline.vlm_text_run import run_vlm_text_only
 
 _log = logging.getLogger(__name__)
@@ -20,7 +22,7 @@ def main() -> None:
     parent.add_argument("-q", "--quiet", action="store_true", help="仅警告与错误 (WARNING)")
     parser = argparse.ArgumentParser(
         prog="mm-qbank",
-        description="护理题库：VLM 整页转写（JSON 分类）→ 可选 vlm-refine 修正+导出 xlsx → 可选 llm-compose 拆题",
+        description="护理题库：VLM 流式落盘→按题号凑齐即触发教材向修正（流式 CSV 断点续跑）→最终导出 xlsx；支持导入 llm_compose_merged.jsonl",
         parents=[parent],
     )
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -50,14 +52,22 @@ def main() -> None:
     refine = sub.add_parser(
         "vlm-refine",
         parents=[parent],
-        help="读 vlm-text 的 pages.jsonl（需 structured .json），按题号合并问题+解析，再 LLM 对照护理学教材修正，导出 xlsx+jsonl",
+        help="读 pages.jsonl 或 llm_compose_merged.jsonl，按题号合并问题+解析，再 LLM 对照护理学教材修正，导出 xlsx+jsonl",
     )
-    refine.add_argument(
+    srcg = refine.add_mutually_exclusive_group(required=True)
+    srcg.add_argument(
         "--manifest",
         dest="refine_manifest",
         type=Path,
-        required=True,
+        default=None,
         help="vlm-text 的 pages.jsonl 路径",
+    )
+    srcg.add_argument(
+        "--compose-jsonl",
+        dest="compose_jsonl",
+        type=Path,
+        default=None,
+        help="llm-compose 的输出 jsonl（如 vlm_gui_*/llm_compose_merged.jsonl）",
     )
     refine.add_argument(
         "--out-jsonl",
@@ -72,6 +82,13 @@ def main() -> None:
         type=Path,
         default=None,
         help="Excel 表（默认 data/out/refine/refined_merged.xlsx）",
+    )
+    refine.add_argument(
+        "--out-csv",
+        dest="refine_csv",
+        type=Path,
+        default=None,
+        help="流式追加 CSV（默认 data/out/refine/refined_merged_stream.csv）",
     )
     refine.add_argument("--config", dest="refine_config", type=Path, default=None, help="configs/default.yaml")
     refine.add_argument(
@@ -97,6 +114,27 @@ def main() -> None:
     llm.add_argument("--out", dest="out_jsonl", type=Path, required=True, help="输出每页一行 JSON 的 .jsonl")
     llm.add_argument("--config", dest="config", type=Path, default=None, help="覆盖默认 configs/default.yaml")
     llm.add_argument("--model", dest="model", type=str, default=None, help="覆盖环境变量 LLM_MODEL")
+
+    kb = sub.add_parser(
+        "kb-build",
+        parents=[parent],
+        help="离线构建 PDF 知识库（RAG）：PDF→切块→本地 embedding→FAISS",
+    )
+    kb.add_argument("--pdf-dir", type=Path, required=True, help="PDF 目录（递归扫描 *.pdf）")
+    kb.add_argument("--kb", type=str, required=True, help="知识库名称或路径（默认 data/kb/<name>）")
+    kb.add_argument("--model", type=str, default="BAAI/bge-small-zh-v1.5", help="sentence-transformers 模型名")
+    kb.add_argument("--chunk-chars", type=int, default=900)
+    kb.add_argument("--overlap", type=int, default=120)
+    kb.add_argument("--embed-batch", type=int, default=32)
+
+    kq = sub.add_parser(
+        "kb-query",
+        parents=[parent],
+        help="查询知识库 TopK（调试检索命中）",
+    )
+    kq.add_argument("--kb", type=str, required=True, help="知识库名称或路径")
+    kq.add_argument("--q", type=str, required=True, help="查询文本")
+    kq.add_argument("--topk", type=int, default=5)
 
     verify = sub.add_parser(
         "verify-config",
@@ -124,13 +162,24 @@ def main() -> None:
         )
         print(json.dumps(summary, ensure_ascii=False, indent=2))
     elif args.cmd == "vlm-refine":
-        summary = run_refine_vlm_merged(
-            manifest_path=args.refine_manifest,
-            out_jsonl=args.refine_jsonl,
-            out_xlsx=args.refine_xlsx,
-            config_path=args.refine_config,
-            model=args.refine_model,
-        )
+        if args.compose_jsonl is not None:
+            summary = run_refine_from_compose_jsonl(
+                compose_jsonl=args.compose_jsonl,
+                out_jsonl=args.refine_jsonl,
+                out_csv=args.refine_csv,
+                out_xlsx=args.refine_xlsx,
+                config_path=args.refine_config,
+                model=args.refine_model,
+            )
+        else:
+            summary = run_refine_vlm_merged(
+                manifest_path=args.refine_manifest,
+                out_jsonl=args.refine_jsonl,
+                out_csv=args.refine_csv,
+                out_xlsx=args.refine_xlsx,
+                config_path=args.refine_config,
+                model=args.refine_model,
+            )
         print(json.dumps(summary, ensure_ascii=False, indent=2))
     elif args.cmd == "llm-compose":
         summary = run_llm_compose_manifest(
@@ -140,6 +189,32 @@ def main() -> None:
             model=args.model,
         )
         print(json.dumps(summary, ensure_ascii=False, indent=2))
+    elif args.cmd == "kb-build":
+        kb_root = kb_dir_from_arg(args.kb)
+        summary = build_kb_from_pdf_dir(
+            pdf_dir=args.pdf_dir,
+            kb_root=kb_root,
+            model_name=args.model,
+            chunk_chars=args.chunk_chars,
+            overlap=args.overlap,
+            embed_batch_size=args.embed_batch,
+        )
+        print(json.dumps(summary, ensure_ascii=False, indent=2))
+    elif args.cmd == "kb-query":
+        kb_root = kb_dir_from_arg(args.kb)
+        store = load_kb(kb_root=kb_root)
+        hits = store.query(args.q, topk=int(args.topk))
+        out = [
+            {
+                "score": h.score,
+                "pdf": h.chunk.pdf_name,
+                "page": h.chunk.page_index + 1,
+                "id": h.chunk.id,
+                "text_preview": (h.chunk.text[:240] + ("…" if len(h.chunk.text) > 240 else "")),
+            }
+            for h in hits
+        ]
+        print(json.dumps({"kb_root": str(kb_root), "topk": args.topk, "hits": out}, ensure_ascii=False, indent=2))
     elif args.cmd == "verify-config":
         summary = run_verify(
             config_path=args.verify_config,

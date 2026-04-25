@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "nursing-mm-qbank"
-version = "0.1.3"
-description = "护理类题库：VLM 整页转写、教材向修正+导出 xlsx、拆题，OpenAI 兼容 API"
+version = "0.1.4"
+description = "护理题库：VLM 流式落盘→凑齐题号即触发教材向修正（流式 CSV 断点续跑）→最终导出 xlsx；支持导入 llm_compose_merged.jsonl"
 requires-python = ">=3.10"
 dependencies = [
   "opencv-python>=4.8.0",
@@ -15,6 +15,10 @@ dependencies = [
   "openpyxl>=3.1.0",
   "pyyaml>=6.0",
   "python-dotenv>=1.0.0",
+  "sv-ttk>=2.6.0",
+  "pypdf>=4.0.0",
+  "sentence-transformers>=3.0.0",
+  "faiss-cpu>=1.8.0",
 ]
 
 [project.scripts]

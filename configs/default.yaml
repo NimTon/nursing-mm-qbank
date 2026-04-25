@@ -3,6 +3,12 @@ preprocess:
   # 0 = 不缩小原图；正数 = 长边上限，例如 3000
   max_long_edge: 0
   tone_mode: raw
+  # 自动按 EXIF 方向纠正（手机竖拍常见）
+  auto_exif: true
+  # 自动判断 0/90/180/270（按“横排文字”启发式打分选择）
+  auto_rotate: true
+  # 固定旋转角度（度）。例如 90/180/270；0 表示不额外旋转
+  rotate_degrees: 0
   deskew:
     enabled: true
     max_abs_degrees: 20
@@ -30,9 +36,9 @@ vlm:
 # web_search: true 时对类 DashScope 基址可附加联网请求头（以供应商为准）
 refine:
   model: qwen3-max
-  batch_size: 30
+  batch_size: 1
   # 多批题块同时请求修正 LLM（批与 batch_size 同序；VLM+compose 均完成后再跑本步）
   max_workers: 8
   temperature: 0.2
   web_search: true
-  timeout_seconds: 180.0
+  timeout_seconds: 300.0
