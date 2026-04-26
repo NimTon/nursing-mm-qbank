@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "nursing-mm-qbank"
-version = "0.1.4"
+version = "0.1.5"
 description = "护理题库：VLM 流式落盘→凑齐题号即触发教材向修正（流式 CSV 断点续跑）→最终导出 xlsx；支持导入 llm_compose_merged.jsonl"
 requires-python = ">=3.10"
 dependencies = [

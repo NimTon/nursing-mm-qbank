@@ -117,6 +117,60 @@ def _safe_name(name: str) -> str:
     return s or "input"
 
 
+def _install_gui_mascot_strip(parent: tk.Misc, font: tuple[Any, ...]) -> None:
+    """在 parent 内放一条循环颜文字（应援棒挥动）；假定 parent 已按右上排版。"""
+    fr = ttk.Frame(parent)
+    fr.pack(fill=tk.X, anchor=tk.E, pady=(2, 0))
+    frames = (
+        "      ∧∧\n"
+        "     (·ω·)っ ❚ 敏敏加油 ❚\n"
+        "     ( U U)  挥挥~",
+        "      ∧∧\n"
+        "    ⊂(·ω· ) ❚ 敏敏加油 ❚っ\n"
+        "     ( U U)  挥挥~",
+        "      ∧∧\n"
+        "     (·ω·)⊃ ❚ 敏敏加油 ❚\n"
+        "     ( U U)  加油!",
+        "      ∧∧\n"
+        "    ⊂(·ω· ) ❚ 敏敏加油 ❚っ\n"
+        "     ( U U)  挥挥~",
+    )
+    lbl = tk.Label(fr, text=frames[0], font=font, justify=tk.LEFT, fg="#5a5a5a")
+    try:
+        bg = parent.tk.call("ttk::style", "lookup", "TFrame", "-background")
+        if bg:
+            lbl.configure(bg=bg)
+    except Exception:  # noqa: BLE001
+        pass
+    lbl.pack(anchor=tk.E, padx=0, pady=0)
+    idx = 0
+    after_id: list[str | int | None] = [None]
+
+    def tick() -> None:
+        nonlocal idx
+        try:
+            if not parent.winfo_exists():
+                return
+        except Exception:  # noqa: BLE001
+            return
+        idx = (idx + 1) % len(frames)
+        lbl.config(text=frames[idx])
+        w = parent.winfo_toplevel()
+        after_id[0] = w.after(480, tick)
+
+    def on_destroy(_: tk.Event[Any]) -> None:
+        aid = after_id[0]
+        if aid is not None:
+            try:
+                parent.winfo_toplevel().after_cancel(aid)
+            except Exception:  # noqa: BLE001
+                pass
+            after_id[0] = None
+
+    fr.bind("<Destroy>", on_destroy)
+    tick()
+
+
 def main() -> None:
     global _LOG_QUEUE  # noqa: PLW0603
 
@@ -225,9 +279,13 @@ def main() -> None:
     fr_top.pack(fill=tk.X, padx=8, pady=4)
     fr_top_bar = ttk.Frame(fr_top)
     fr_top_bar.pack(fill=tk.X)
-    ttk.Label(fr_top_bar, text=f"v{__version__}", foreground="#666", font=_font_small).pack(
-        side=tk.RIGHT, padx=(4, 0)
+    fr_top_right = ttk.Frame(fr_top_bar)
+    fr_top_right.pack(side=tk.RIGHT, padx=(4, 0))
+    ttk.Label(fr_top_right, text=f"v{__version__}", foreground="#666", font=_font_small).pack(anchor=tk.E)
+    _mono_mascot: tuple[Any, ...] = _font_mono or (
+        ("Consolas", 9) if os.name == "nt" else ("monospace", 9)
     )
+    _install_gui_mascot_strip(fr_top_right, _mono_mascot)
     btn_dir = ttk.Button(fr_top_bar, text="选择图片文件夹…")
     btn_dir.pack(side=tk.LEFT, padx=(0, 8))
     btn_files = ttk.Button(fr_top_bar, text="选择图片（可多选）…")
@@ -597,6 +655,9 @@ def main() -> None:
 
             def u() -> None:
                 pb["value"] = min(1000, max(0, v))
+                # 状态补充：让用户能直观看到 LLM 修正进度在走
+                if n_total > 0:
+                    st_lbl.config(text=f"教材向修正 {n_done}/{n_total} · {50.0 + 50.0 * min(max(n_done, 0), n_total) / max(1, n_total):.1f}%")
 
             root.after(0, u)
 
