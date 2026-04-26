@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
-from typing import Iterable
+from typing import Callable, Iterable
 
 import numpy as np
 from sentence_transformers import SentenceTransformer
@@ -52,16 +52,25 @@ def embed_iter(
     texts: Iterable[str],
     *,
     batch_size: int = 32,
+    total: int | None = None,
+    on_batch: Callable[[int, int | None], None] | None = None,
 ) -> np.ndarray:
     buf: list[str] = []
     out_parts: list[np.ndarray] = []
+    done = 0
     for t in texts:
         buf.append(t)
         if len(buf) >= batch_size:
             out_parts.append(embedder.embed_texts(buf, batch_size=batch_size))
+            done += len(buf)
+            if on_batch is not None:
+                on_batch(done, total)
             buf.clear()
     if buf:
         out_parts.append(embedder.embed_texts(buf, batch_size=batch_size))
+        done += len(buf)
+        if on_batch is not None:
+            on_batch(done, total)
     if not out_parts:
         return np.zeros((0, 0), dtype=np.float32)
     return np.vstack(out_parts)

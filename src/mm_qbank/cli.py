@@ -5,7 +5,6 @@ import json
 import logging
 from pathlib import Path
 
-from mm_qbank.api_verify import run_verify
 from mm_qbank.logging_utils import configure_logging
 from mm_qbank.kb.kb_build import build_kb_from_pdf_dir
 from mm_qbank.kb.kb_store import kb_dir_from_arg, load_kb
@@ -216,6 +215,13 @@ def main() -> None:
         ]
         print(json.dumps({"kb_root": str(kb_root), "topk": args.topk, "hits": out}, ensure_ascii=False, indent=2))
     elif args.cmd == "verify-config":
+        try:
+            from mm_qbank.api_verify import run_verify  # type: ignore
+        except ModuleNotFoundError as e:
+            raise SystemExit(
+                "缺少可选模块 `mm_qbank.api_verify`：当前工程无法运行 `verify-config`。\n"
+                "如果你不需要该命令，可忽略；若需要，请从上游同步/恢复 `src/mm_qbank/api_verify.py`。"
+            ) from e
         summary = run_verify(
             config_path=args.verify_config,
             vlm_model=args.vlm_model,

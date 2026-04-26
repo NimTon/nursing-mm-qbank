@@ -38,7 +38,23 @@ def kb_dir_from_arg(kb: str | Path) -> Path:
     if str(p).strip() and (p.exists() or p.parent.exists() or p.is_absolute() or any(sep in str(p) for sep in ("/", "\\"))):
         # 传的是路径（或看起来像路径）
         return p.resolve()
-    return (project_root() / "data" / "kb" / str(kb)).resolve()
+    # 传的是“名字”（不是路径）
+    name = str(kb).strip()
+    # Windows + FAISS：非 ASCII 路径可能导致底层 fopen 无法创建 index.faiss（报 No such file or directory）。
+    # 这里把 name 映射到一个 ASCII 安全的目录名，尽量避免中文/特殊字符。
+    try:
+        import os
+        import re
+        import hashlib
+
+        if os.name == "nt":
+            if any(ord(ch) > 127 for ch in name):
+                digest = hashlib.sha1(name.encode("utf-8")).hexdigest()[:10]
+                name = f"kb_{digest}"
+            name = re.sub(r'[^A-Za-z0-9._-]+', "_", name).strip("._-") or "kb"
+    except Exception:
+        pass
+    return (project_root() / "data" / "kb" / name).resolve()
 
 
 def kb_paths(kb_root: Path) -> KBStorePaths:

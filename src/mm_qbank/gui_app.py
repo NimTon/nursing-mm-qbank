@@ -16,14 +16,18 @@ from __future__ import annotations
 import logging
 import os
 import queue
+import json
 import shutil
 import subprocess
 import sys
 import tempfile
 import threading
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+import yaml
+import re
 
 if sys.platform == "win32":
     # 1440p/高分屏下避免 Tk 被系统拉伸导致字体发糊：尽量启用 Per-Monitor DPI Aware
@@ -63,7 +67,7 @@ except Exception:  # noqa: BLE001
     sv_ttk = None  # type: ignore[assignment]
 
 from mm_qbank import __version__
-from mm_qbank.config import project_root
+from mm_qbank.config import load_config, project_root
 from mm_qbank.logging_utils import configure_logging
 from mm_qbank.pipeline.llm_compose_run import run_llm_compose_manifest
 from mm_qbank.pipeline.refine_vlm_run import (
@@ -104,6 +108,13 @@ def _list_images(d: Path) -> list[Path]:
         for p in d.rglob("*")
         if p.is_file() and p.suffix.lower() in exts
     )
+
+
+def _safe_name(name: str) -> str:
+    s = (name or "").strip()
+    s = re.sub(r"[\\/:*?\"<>|]+", "_", s)
+    s = re.sub(r"\s+", "_", s)
+    return s or "input"
 
 
 def main() -> None:
@@ -329,7 +340,7 @@ def main() -> None:
     # 输出说明
     fr_out = ttk.LabelFrame(content, text="输出位置", padding=6)
     fr_out.pack(fill=tk.X, padx=8, pady=4)
-    ex = (project_root() / "data" / "out" / "vlm_gui_YYYYMMDD_hhmmss").as_posix()
+    ex = (project_root() / "data" / "out" / "vlm_gui_YYYYMMDD_hhmmss_输入文件夹名").as_posix()
     lbl_path = ttk.Label(fr_out, text=f"开始转写时生成时间戳，目录形如: {ex}", wraplength=800)
     lbl_path.pack(anchor=tk.W)
 
@@ -462,6 +473,25 @@ def main() -> None:
         btn_files["state"] = state
         btn_compose["state"] = state
 
+    def _reset_to_initial(*, keep_last_out: bool = True) -> None:
+        """一次任务结束后回到初始可运行状态（保留日志；可选择保留 last_out 以便打开目录）。"""
+        # 清空输入选择
+        work_dir[0] = None
+        is_temp[0] = False
+        compose_jsonl_in[0] = None
+        _clear_input_preview()
+        lbl_in.config(text="未选择", foreground="#666")
+        # 进度与状态
+        pb["value"] = 0
+        st_lbl.config(text="空闲", foreground="black")
+        root.config(cursor="")
+        # “打开输出目录”是否可用
+        if keep_last_out and last_out[0] and Path(str(last_out[0])).is_dir():
+            btn_ref["state"] = tk.NORMAL
+        else:
+            last_out[0] = None
+            btn_ref["state"] = tk.DISABLED
+
     def _set_run_buttons(*, working: bool, paused: bool) -> None:
         is_running[0] = working
         if not working:
@@ -499,20 +529,40 @@ def main() -> None:
             out = cp.parent
         else:
             ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-            out = project_root() / "data" / "out" / f"vlm_gui_{ts}"
+            src_name = "input"
+            if wd is not None and isinstance(wd, Path) and wd.name:
+                src_name = _safe_name(wd.name)
+            out = project_root() / "data" / "out" / f"vlm_gui_{ts}_{src_name}"
             out.mkdir(parents=True, exist_ok=True)
         last_out[0] = out
         lbl_path.config(text=f"本次输出: {out.resolve()}", foreground="black")
 
+        # 导出文件名也带上“输入文件夹名”，避免同目录下分不清来源
+        if cp is not None:
+            export_tag = _safe_name(cp.parent.name or "compose")
+        else:
+            export_tag = src_name
+        out_jsonl_path = out / f"refined_merged_{export_tag}.jsonl"
+        out_csv_path = out / f"refined_merged_stream_{export_tag}.csv"
+        out_xlsx_path = out / f"refined_merged_{export_tag}.xlsx"
+
         if cp is not None:
             st_lbl.config(text="compose jsonl → 教材向修正（流式 CSV + xlsx）…")
         else:
-            st_lbl.config(
-                text=(
-                    f"待处理 {n} 张 · 0%（VLM 多图并行 + 流式落盘；按题号凑齐即触发教材向修正并流式写 CSV；"
-                    f"页与页之间可暂停/结束，单页请求中需等待返回）"
+            if bool(stream_refine_var.get()):
+                st_lbl.config(
+                    text=(
+                        f"待处理 {n} 张 · 0%（流式：VLM 多图并行 + 流式落盘；"
+                        f"按题号凑齐后触发教材向修正并流式写 CSV；页与页之间可暂停/结束）"
+                    )
                 )
-            )
+            else:
+                st_lbl.config(
+                    text=(
+                        f"待处理 {n} 张 · 0%（顺序：VLM 全部完成后再开始教材向修正；"
+                        f"页与页之间可暂停/结束，单页请求中需等待返回）"
+                    )
+                )
         _set_input_buttons(tk.DISABLED)
         _set_run_buttons(working=True, paused=False)
         btn_ref["state"] = tk.DISABLED
@@ -525,12 +575,28 @@ def main() -> None:
         def on_vlm_page(i: int, t: int) -> None:
             if t <= 0:
                 return
-            v = int(1000 * i / t)
+            # 进度：VLM 占 50%
+            v = int(500 * i / t)
 
             def u() -> None:
                 pb["value"] = min(1000, v)
                 p = 100.0 * i / t
-                st_lbl.config(text=f"VLM {i}/{t} · {p:.1f}%（后台：教材向修正进行中…）")
+                if bool(stream_refine_var.get()):
+                    st_lbl.config(text=f"VLM {i}/{t} · {p:.1f}%（流式：凑题缓存→教材向修正进行中…）")
+                else:
+                    st_lbl.config(text=f"VLM {i}/{t} · {p:.1f}%（顺序：VLM 完成后才开始教材向修正…）")
+
+            root.after(0, u)
+
+        def on_refine_progress(n_done: int, n_total: int) -> None:
+            # 进度：LLM(修正) 占 50%
+            if n_total <= 0:
+                v = 500
+            else:
+                v = 500 + int(500 * min(max(n_done, 0), n_total) / max(1, n_total))
+
+            def u() -> None:
+                pb["value"] = min(1000, max(0, v))
 
             root.after(0, u)
 
@@ -570,22 +636,67 @@ def main() -> None:
             err: str | None = None
             vlm: dict[str, Any] = {}
             try:
+                runtime_cfg = _write_runtime_config(out)
                 if cp is None:
-                    # 流水线：VLM 每页完成就触发合并与 LLM 修正（凑齐一批就请求），更省总时间
-                    vlm = run_vlm_text_and_refine_streaming(
-                        input_dir=wd,  # type: ignore[arg-type]
-                        out_dir=out,
-                        config_path=None,
-                        vlm_model=None,
-                        refine_model=None,
-                        out_jsonl=out / "refined_merged.jsonl",
-                        out_csv=out / "refined_merged_stream.csv",
-                        out_xlsx=out / "refined_merged.xlsx",
-                        cancel_event=run_cancel,
-                        paused=paused_fn,
-                        on_vlm_page_done=on_vlm_page,
-                        on_refine_item_done=on_refine_item_done,
-                    )
+                    if bool(stream_refine_var.get()):
+                        # 流式模式：VLM 每页完成就进入题号缓冲，凑齐同题问题+解析即入批，满批就请求修正并流式写 CSV
+                        root.after(0, lambda: st_lbl.config(text="流式：VLM →（凑题缓存）→ 教材向修正（LLM）…"))
+                        s = run_vlm_text_and_refine_streaming(
+                            input_dir=wd,  # type: ignore[arg-type]
+                            out_dir=out,
+                            config_path=runtime_cfg,
+                            vlm_model=None,
+                            refine_model=None,
+                            out_jsonl=out_jsonl_path,
+                            out_csv=out_csv_path,
+                            out_xlsx=out_xlsx_path,
+                            cancel_event=run_cancel,
+                            paused=paused_fn,
+                            on_vlm_page_done=on_vlm_page,
+                            on_refine_item_done=on_refine_item_done,
+                            on_refine_progress=on_refine_progress,
+                        )
+                        # GUI 旧结构兼容：把 refine 摘要塞回 vlm dict
+                        rf = {
+                            "n_rows": s.get("n_rows", 0),
+                            "out_jsonl": s.get("out_jsonl", ""),
+                            "out_csv": s.get("out_csv", ""),
+                            "out_xlsx": s.get("out_xlsx", ""),
+                            "model": s.get("refine_model", ""),
+                            "web_search": s.get("web_search", False),
+                        }
+                        vlm = {k: v for k, v in s.items() if k not in ("n_rows", "out_jsonl", "out_csv", "out_xlsx", "refine_model")}
+                        vlm["refine"] = rf
+                    else:
+                        # 顺序模式：先等待 VLM 全部页完成并落盘（pages.jsonl），再统一跑教材向修正（LLM）。
+                        vlm = run_vlm_text_only(
+                            input_dir=wd,  # type: ignore[arg-type]
+                            out_dir=out,
+                            config_path=None,
+                            model=None,
+                            cancel_event=run_cancel,
+                            paused=paused_fn,
+                            on_page_done=on_vlm_page,
+                        )
+                        mp = vlm.get("manifest")
+                        ok_m = (
+                            bool(mp)
+                            and Path(str(mp)).is_file()
+                            and any(L.strip() for L in Path(str(mp)).read_text(encoding="utf-8").splitlines())
+                        )
+                        if ok_m and not vlm.get("cancelled", False):
+                            root.after(0, lambda: st_lbl.config(text="VLM 已完成，开始教材向修正（等待全部 VLM 后再给 LLM）…"))
+                            rf = run_refine_vlm_merged(
+                                manifest_path=Path(str(mp)),
+                                out_jsonl=out_jsonl_path,
+                                out_csv=out_csv_path,
+                                out_xlsx=out_xlsx_path,
+                                config_path=runtime_cfg,
+                                model=None,
+                                on_refine_progress=on_refine_progress,
+                            )
+                            # 与旧 streaming 返回结构兼容：把 refine 摘要塞回 vlm dict
+                            vlm = {**vlm, "refine": rf}
                 else:
                     vlm = {}
             except Exception as e:  # noqa: BLE001
@@ -599,16 +710,18 @@ def main() -> None:
                     root.after(0, lambda: st_lbl.config(text="教材向修正并导出 xlsx（compose 输入）…"))
                     sm["refine"] = run_refine_from_compose_jsonl(
                         compose_jsonl=cp,
-                        out_jsonl=out / "refined_merged.jsonl",
-                        out_csv=out / "refined_merged_stream.csv",
-                        out_xlsx=out / "refined_merged.xlsx",
-                        config_path=None,
+                        out_jsonl=out_jsonl_path,
+                        out_csv=out_csv_path,
+                        out_xlsx=out_xlsx_path,
+                        config_path=_write_runtime_config(out),
                         model=None,
+                        on_refine_progress=on_refine_progress,
                     )
                 except Exception as e3:  # noqa: BLE001
                     sm["refine"] = {"error": str(e3)}
             elif err is None and vlm and not vlm.get("cancelled", False):
-                sm = {**vlm, "llm_compose": None, "refine": None, "compose_error": None}
+                # 顺序模式：若上游已跑过 refine，则复用；否则仅做 compose
+                sm = {**vlm, "llm_compose": None, "refine": (vlm.get("refine") if isinstance(vlm.get("refine"), dict) else None), "compose_error": None}
                 mp = vlm.get("manifest")
                 ok_m = (
                     bool(mp)
@@ -631,12 +744,7 @@ def main() -> None:
                     except Exception as e2:  # noqa: BLE001
                         sm["compose_error"] = str(e2)
                         sm["llm_compose"] = None
-                    # refine 已在 streaming 阶段完成；这里只做 compose 提取即可
-                    sm["refine"] = {
-                        "out_jsonl": str(out / "refined_merged.jsonl"),
-                        "out_csv": str(out / "refined_merged_stream.csv"),
-                        "out_xlsx": str(out / "refined_merged.xlsx"),
-                    }
+                    # refine：顺序模式下可能已完成（vlm['refine']），否则不强行填充
             elif vlm:
                 sm = {**vlm, "llm_compose": None, "refine": None}
             if not sm and vlm:
@@ -670,6 +778,7 @@ def main() -> None:
                 st_lbl.config(text="失败", foreground="red")
                 _append_t(f"\n[错误] {e}\n")
                 messagebox.showerror("转写失败", e)
+                _reset_to_initial(keep_last_out=True)
                 return
             lc = s.get("llm_compose")
             vlm_c = s.get("cancelled", False)
@@ -698,6 +807,7 @@ def main() -> None:
                     _reveal_dir(last_path)
                 except Exception as ex:  # noqa: BLE001
                     _append_t(f"自动打开目录失败: {ex}\n")
+                _reset_to_initial(keep_last_out=True)
                 return
             pb["value"] = 1000
             od = s.get("out_dir") or str(out)
@@ -737,6 +847,7 @@ def main() -> None:
                 _reveal_dir(last_out[0] or out)
             except Exception as ex:  # noqa: BLE001
                 _append_t(f"自动打开目录失败: {ex}\n")
+            _reset_to_initial(keep_last_out=True)
 
         threading.Thread(target=work, daemon=True).start()
 
@@ -800,8 +911,9 @@ def main() -> None:
         nb.add(tab_query, text="查询")
 
         # --- 构建 tab
-        pdf_dir_var = tk.StringVar(value="")
-        kb_var = tk.StringVar(value="nursing_textbook")
+        # PDF 输入：支持“选择多文件”写入，也支持用户手动粘贴路径（分号/换行分隔）
+        pdf_pick_var = tk.StringVar(value="")
+        kb_parent_var = tk.StringVar(value="data/kb")
         local_default = (project_root() / "models" / "BAAI" / "bge-small-zh-v1.5").resolve()
         model_var = tk.StringVar(value=(str(local_default) if local_default.is_dir() else "BAAI/bge-small-zh-v1.5"))
         chunk_chars_var = tk.StringVar(value="900")
@@ -810,6 +922,7 @@ def main() -> None:
         build_status_var = tk.StringVar(value="空闲")
         build_busy: list[bool] = [False]
         last_kb_root: list[Path | None] = [None]
+        picked_pdfs: list[Path] = []
 
         fr_b_in = ttk.LabelFrame(tab_build, text="输入与参数", padding=8)
         fr_b_in.pack(fill=tk.X, pady=(0, 10))
@@ -820,21 +933,30 @@ def main() -> None:
             return r
 
         r1 = _row(fr_b_in)
-        ttk.Label(r1, text="PDF 目录：", width=10).pack(side=tk.LEFT)
-        ent_pdf = ttk.Entry(r1, textvariable=pdf_dir_var)
+        ttk.Label(r1, text="PDF 文件：", width=10).pack(side=tk.LEFT)
+        ent_pdf = ttk.Entry(r1, textvariable=pdf_pick_var)
         ent_pdf.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 8))
 
-        def pick_pdf_dir() -> None:
-            p = filedialog.askdirectory(title="选择 PDF 目录", mustexist=True)
-            if p:
-                pdf_dir_var.set(p)
+        def pick_pdf_files() -> None:
+            nonlocal picked_pdfs
+            files = filedialog.askopenfilenames(
+                title="选择一个或多个 PDF（每个 PDF 构建一个 KB）",
+                filetypes=[("PDF", "*.pdf"), ("全部", "*.*")],
+            )
+            if not files:
+                return
+            picked_pdfs = [Path(f) for f in files if Path(f).is_file()]
+            # 把真实路径写进输入框，避免“只显示已选N个”导致构建时拿不到文件列表
+            pdf_pick_var.set(";\n".join(str(p) for p in picked_pdfs))
 
-        ttk.Button(r1, text="选择…", width=10, command=pick_pdf_dir).pack(side=tk.LEFT)
+        ttk.Button(r1, text="选择…", width=10, command=pick_pdf_files).pack(side=tk.LEFT)
 
         r2 = _row(fr_b_in)
-        ttk.Label(r2, text="KB：", width=10).pack(side=tk.LEFT)
-        ttk.Entry(r2, textvariable=kb_var).pack(side=tk.LEFT, fill=tk.X, expand=True)
-        ttk.Label(r2, text="（名称或路径）", foreground="#666").pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Label(r2, text="KB 父目录：", width=10).pack(side=tk.LEFT)
+        ttk.Entry(r2, textvariable=kb_parent_var).pack(side=tk.LEFT, fill=tk.X, expand=True)
+        ttk.Label(r2, text="（默认 data/kb；每个 PDF 用文件名建子目录）", foreground="#666").pack(
+            side=tk.LEFT, padx=(8, 0)
+        )
 
         r3 = _row(fr_b_in)
         ttk.Label(r3, text="模型：", width=10).pack(side=tk.LEFT)
@@ -883,14 +1005,20 @@ def main() -> None:
         def on_build() -> None:
             if build_busy[0]:
                 return
-            pdf_dir_s = (pdf_dir_var.get() or "").strip()
-            kb_s = (kb_var.get() or "").strip()
+            kb_parent_s = (kb_parent_var.get() or "").strip()
             model_s = (model_var.get() or "").strip()
-            if not pdf_dir_s:
-                messagebox.showwarning("提示", "请先选择 PDF 目录。")
-                return
-            if not kb_s:
-                messagebox.showwarning("提示", "请填写 KB 名称或路径。")
+            # 兼容：若用户手动粘贴到输入框，则从输入框解析；否则用选择器缓存的 picked_pdfs
+            pdfs: list[Path] = []
+            if picked_pdfs:
+                pdfs = list(picked_pdfs)
+            else:
+                raw = (pdf_pick_var.get() or "").strip()
+                if raw:
+                    parts = [p.strip().strip('"') for p in raw.replace("\r", "").replace("\n", ";").split(";")]
+                    pdfs = [Path(p) for p in parts if p]
+            pdfs = [p for p in pdfs if p.is_file() and p.suffix.lower() == ".pdf"]
+            if not pdfs:
+                messagebox.showwarning("提示", "请先选择一个或多个 PDF 文件（或在输入框粘贴 PDF 路径）。")
                 return
             if not model_s:
                 messagebox.showwarning("提示", "请填写 embedding 模型名。")
@@ -902,31 +1030,121 @@ def main() -> None:
             except ValueError:
                 messagebox.showwarning("提示", "chunk/overlap/batch 必须是整数。")
                 return
-
-            pdf_dir = Path(pdf_dir_s)
-            if not pdf_dir.is_dir():
-                messagebox.showwarning("提示", "PDF 目录不存在或不可用。")
-                return
+            kb_parent = Path(kb_parent_s) if kb_parent_s else (project_root() / "data" / "kb")
+            if not kb_parent.is_absolute():
+                kb_parent = (project_root() / kb_parent).resolve()
+            kb_parent.mkdir(parents=True, exist_ok=True)
 
             _set_build_busy(True)
             build_status_var.set("构建中…")
-            _append_build(f"\n==== 开始构建 ====\nPDF: {pdf_dir}\nKB: {kb_s}\nmodel: {model_s}\n")
-            logging.getLogger(__name__).info("kb-build: pdf_dir=%s kb=%s model=%s", pdf_dir, kb_s, model_s)
+            _append_build(f"\n==== 开始构建（每个 PDF 一个 KB）====\nPDF: {len(pdfs)} 个\nKB 父目录: {kb_parent}\nmodel: {model_s}\n")
+            logging.getLogger(__name__).info("kb-build: n_pdfs=%s kb_parent=%s model=%s", len(pdfs), kb_parent, model_s)
 
             def work() -> None:
                 err: str | None = None
-                summary: dict[str, Any] | None = None
+                summaries: list[dict[str, Any]] = []
                 kb_root: Path | None = None
                 try:
-                    kb_root = kb_dir_from_arg(kb_s)
-                    summary = build_kb_from_pdf_dir(
-                        pdf_dir=pdf_dir,
-                        kb_root=kb_root,
-                        model_name=model_s,
-                        chunk_chars=chunk_chars,
-                        overlap=overlap,
-                        embed_batch_size=batch,
-                    )
+                    from mm_qbank.kb.kb_build import build_kb_from_pdf_paths  # 延迟导入
+
+                    used: set[str] = set()
+                    total_books = len(pdfs)
+                    last_ui_log_at = 0.0
+                    invalid = '<>:"/\\\\|?*'
+
+                    def _safe_dir_name(s: str) -> str:
+                        # Windows 文件夹名清洗 + 去尾部空格/点
+                        # 重要：FAISS 在 Windows 上对「非 ASCII 路径」可能无法写入（底层 fopen）。
+                        # 因此：若包含非 ASCII，使用稳定 hash 作为目录名；否则做常规清洗。
+                        raw = (s or "").strip()
+                        if any(ord(ch) > 127 for ch in raw):
+                            import hashlib
+
+                            digest = hashlib.sha1(raw.encode("utf-8")).hexdigest()[:10]
+                            return f"kb_{digest}"
+                        out = "".join(("_" if ch in invalid else ch) for ch in raw)
+                        out = out.strip().strip(".")
+                        return out or "book"
+
+                    def on_progress(stage: str, done: int, total: int | None, msg: str) -> None:
+                        # embedding 录入会非常频繁，这里做节流，避免刷屏阻塞 GUI
+                        nonlocal last_ui_log_at
+                        now = time.time()
+                        if stage == "embed_batch" and (now - last_ui_log_at) < 0.35:
+                            return
+                        last_ui_log_at = now
+
+                        def u() -> None:
+                            if total and total > 0:
+                                _append_build(f"[{stage}] {msg}（{done}/{total}）")
+                                build_status_var.set(f"{stage}: {done}/{total}")
+                            else:
+                                _append_build(f"[{stage}] {msg}")
+                                build_status_var.set(f"{stage}: {done}")
+
+                        root.after(0, u)
+
+                    for bi, pdf_path in enumerate(list(pdfs), start=1):
+                        display_name = (pdf_path.stem or f"book_{bi}").strip() or f"book_{bi}"
+                        stem = _safe_dir_name(display_name)
+                        # 避免同名覆盖
+                        name = stem
+                        k = 2
+                        while name in used or (kb_parent / name).exists():
+                            name = f"{stem}_{k}"
+                            k += 1
+                        used.add(name)
+                        kb_root = (kb_parent / name).resolve()
+                        # 显式创建目录，避免后续底层写入时报“目录不存在”
+                        kb_root.mkdir(parents=True, exist_ok=True)
+                        if not kb_root.is_dir():
+                            raise OSError(f"无法创建知识库目录: {kb_root}")
+
+                        # 维护一个父目录级别的映射：safe_name -> 原始显示名
+                        try:
+                            import json
+
+                            mp_path = (kb_parent / "name_map.json").resolve()
+                            mp: dict[str, str] = {}
+                            if mp_path.is_file():
+                                mp0 = json.loads(mp_path.read_text(encoding="utf-8") or "{}")
+                                if isinstance(mp0, dict):
+                                    mp = {str(k): str(v) for k, v in mp0.items()}
+                            mp[name] = display_name
+                            mp_path.write_text(json.dumps(mp, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+                        except Exception:
+                            pass
+
+                        root.after(
+                            0,
+                            lambda bi=bi, tb=total_books, pdf_path=pdf_path, kb_root=kb_root: (
+                                _append_build(f"\n---- [{bi}/{tb}] 开始：{pdf_path.name} -> {kb_root}\n"),
+                                build_status_var.set(f"book {bi}/{tb}: start"),
+                            ),
+                        )
+
+                        summary = build_kb_from_pdf_paths(
+                            pdf_paths=[pdf_path],
+                            kb_root=kb_root,
+                            model_name=model_s,
+                            chunk_chars=chunk_chars,
+                            overlap=overlap,
+                            embed_batch_size=batch,
+                            kb_display_name=display_name,
+                            on_progress=lambda st, d, t, m, bi=bi, tb=total_books: on_progress(
+                                st,
+                                d,
+                                t,
+                                f"[{bi}/{tb}] {m}",
+                            ),
+                        )
+                        summaries.append(summary)
+                        root.after(
+                            0,
+                            lambda bi=bi, tb=total_books, kb_root=kb_root: _append_build(
+                                f"---- [{bi}/{tb}] 完成：{kb_root}\n"
+                            ),
+                        )
                 except Exception as e:  # noqa: BLE001
                     err = str(e)
 
@@ -940,8 +1158,19 @@ def main() -> None:
                     last_kb_root[0] = kb_root
                     build_status_var.set("完成")
                     btn_open_kb["state"] = tk.NORMAL
-                    _append_build(json.dumps(summary or {}, ensure_ascii=False, indent=2) + "\n")
-                    messagebox.showinfo("构建完成", f"已生成知识库：{kb_root}")
+                    _append_build(json.dumps({"books": summaries}, ensure_ascii=False, indent=2) + "\n")
+                    # 优先展示原始书名（若有）
+                    show_name = None
+                    try:
+                        if kb_root is not None:
+                            mf = (Path(kb_root) / "kb_manifest.json").read_text(encoding="utf-8")
+                            d = json.loads(mf)
+                            if isinstance(d, dict) and d.get("kb_display_name"):
+                                show_name = str(d.get("kb_display_name"))
+                    except Exception:
+                        show_name = None
+                    tail = (f"{show_name} -> {kb_root}" if show_name else f"{kb_root}")
+                    messagebox.showinfo("构建完成", f"已生成 {len(summaries)} 个知识库。\n最后一个：{tail}")
 
                 root.after(0, done)
 
@@ -950,7 +1179,7 @@ def main() -> None:
         btn_build["command"] = on_build
 
         # --- 查询 tab
-        q_kb_var = tk.StringVar(value=kb_var.get())
+        q_kb_var = tk.StringVar(value="")
         q_model_var = tk.StringVar(value="")  # 可选覆盖 manifest 里的模型
         q_text_var = tk.StringVar(value="")
         q_topk_var = tk.StringVar(value="5")
@@ -1003,9 +1232,6 @@ def main() -> None:
                 return
             kb_s = (q_kb_var.get() or "").strip()
             q = (q_text_var.get() or "").strip()
-            if not kb_s:
-                messagebox.showwarning("提示", "请填写 KB 名称或路径。")
-                return
             if not q:
                 messagebox.showwarning("提示", "请输入问题。")
                 return
@@ -1027,10 +1253,63 @@ def main() -> None:
                 err: str | None = None
                 hits: list[Any] | None = None
                 kb_root = None
+                kb_used: list[str] | None = None
                 try:
-                    kb_root = kb_dir_from_arg(kb_s)
-                    store = load_kb(kb_root=kb_root, model_name=model_override)
-                    hits = store.query(q, topk=topk)
+                    if kb_s:
+                        kb_root = kb_dir_from_arg(kb_s)
+                        store = load_kb(kb_root=kb_root, model_name=model_override)
+                        hits = store.query(q, topk=topk)
+                        kb_used = [str(kb_root)]
+                    else:
+                        # KB 为空：扫描 data/kb 下所有 KB，全库检索并取全局 TopK。
+                        from mm_qbank.kb.embed import Embedder
+                        from mm_qbank.kb.index_faiss import load_chunks_jsonl, load_faiss_index, load_kb_manifest, search
+
+                        kb_parent = (project_root() / "data" / "kb").resolve()
+                        roots: list[Path] = []
+                        if kb_parent.is_dir():
+                            for p in kb_parent.iterdir():
+                                if not p.is_dir():
+                                    continue
+                                if (
+                                    (p / "kb_manifest.json").is_file()
+                                    and (p / "chunks.jsonl").is_file()
+                                    and (p / "index.faiss").is_file()
+                                ):
+                                    roots.append(p.resolve())
+                        if not roots:
+                            raise FileNotFoundError(f"未找到任何 KB：{kb_parent}")
+
+                        # 读取每个 KB 的 model_name；不同 embedding 模型的 score 不可直接比
+                        model_groups: dict[str, list[Path]] = {}
+                        kb_display: dict[str, str] = {}
+                        for r in roots:
+                            mf = load_kb_manifest((r / "kb_manifest.json").resolve())
+                            mname = str(mf.get("model_name") or "").strip()
+                            if not mname:
+                                continue
+                            model_groups.setdefault(mname, []).append(r)
+                            disp = str(mf.get("kb_display_name") or "").strip() or r.name
+                            kb_display[str(r)] = disp
+                        if not model_groups:
+                            raise ValueError(f"KB manifest 缺少 model_name：{kb_parent}")
+
+                        primary_model = sorted(model_groups.items(), key=lambda kv: len(kv[1]), reverse=True)[0][0]
+                        emb = Embedder(primary_model).embed_texts([q], batch_size=1)[0]
+
+                        all_hits: list[Any] = []
+                        for r in model_groups.get(primary_model, []):
+                            idx = load_faiss_index((r / "index.faiss").resolve())
+                            chunks = load_chunks_jsonl((r / "chunks.jsonl").resolve())
+                            hs = search(index=idx, chunks=chunks, query_embedding=emb, topk=max(1, int(topk)))
+                            disp = kb_display.get(str(r), r.name)
+                            for h in hs:
+                                # 复用 KBSearchHit 结构，让下方渲染逻辑保持一致：给 chunk 增加 book 字段不方便，
+                                # 这里用一个轻量 dict 包装。
+                                all_hits.append({"hit": h, "kb_root": r, "kb_display": disp})
+                        all_hits.sort(key=lambda x: float(x["hit"].score), reverse=True)
+                        hits = all_hits[: max(1, int(topk))]
+                        kb_used = [str(p) for p in model_groups.get(primary_model, [])]
                 except Exception as e:  # noqa: BLE001
                     err = str(e)
 
@@ -1041,15 +1320,24 @@ def main() -> None:
                         _append_q(f"\n[错误] {err}\n")
                         return
                     q_status_var.set("完成")
-                    _append_q(f"\nKB 目录: {kb_root}\n命中: {len(hits or [])}\n")
+                    if kb_s:
+                        _append_q(f"\nKB 目录: {kb_root}\n命中: {len(hits or [])}\n")
+                    else:
+                        _append_q(f"\nKB: （全库扫描 data/kb）\n参与 KB: {len(kb_used or [])}\n命中: {len(hits or [])}\n")
                     for i, h in enumerate(hits or [], start=1):
-                        c = h.chunk
-                        _append_q(
-                            (
-                                f"\n[{i}] score={h.score:.4f}  pdf={c.pdf_name}  page={c.page_index+1}  id={c.id}\n"
-                                f"{c.text}\n"
+                        if isinstance(h, dict) and h.get("hit") is not None:
+                            hh = h["hit"]
+                            c = hh.chunk
+                            src = f"{h.get('kb_display','')} | {c.pdf_name} | p.{c.page_index+1} | score={hh.score:.4f}"
+                            _append_q(f"\n[{i}] {src}  id={c.id}\n{c.text}\n")
+                        else:
+                            c = h.chunk
+                            _append_q(
+                                (
+                                    f"\n[{i}] score={h.score:.4f}  pdf={c.pdf_name}  page={c.page_index+1}  id={c.id}\n"
+                                    f"{c.text}\n"
+                                )
                             )
-                        )
 
                 root.after(0, done)
 
@@ -1077,6 +1365,49 @@ def main() -> None:
     ).pack(side=tk.LEFT)
     ttk.Button(fr_ops_in, text="知识库…", width=10, command=open_kb_dialog).pack(side=tk.RIGHT)
     btn_s["command"] = on_run
+
+    # --- 教材向修正参数（与是否联网脱钩）
+    fr_refine_flags = ttk.Frame(fr_ops)
+    fr_refine_flags.pack(fill=tk.X, pady=(6, 0))
+    ttk.Label(fr_refine_flags, text="修正参数：").pack(side=tk.LEFT)
+
+    # 读取默认配置作为初始值（GUI 允许覆盖；未覆盖时仍是默认行为）
+    _cfg0: dict[str, Any] = {}
+    try:
+        _cfg0 = load_config(None)
+    except Exception:
+        _cfg0 = {}
+    _rcfg0 = dict((_cfg0.get("refine") or {}) if isinstance(_cfg0, dict) else {})
+    _stream0 = bool(_rcfg0.get("stream_refine", False))
+    _use_kb0 = bool(_rcfg0.get("use_kb", True))
+    _web0 = bool(_rcfg0.get("web_search", False))
+    stream_refine_var = tk.BooleanVar(value=_stream0)
+    use_kb_var = tk.BooleanVar(value=_use_kb0)
+    web_search_var = tk.BooleanVar(value=_web0)
+
+    ttk.Checkbutton(fr_refine_flags, text="凑题缓存→流式修正", variable=stream_refine_var).pack(side=tk.LEFT, padx=(6, 0))
+    ttk.Checkbutton(fr_refine_flags, text="使用离线KB", variable=use_kb_var).pack(side=tk.LEFT, padx=(6, 0))
+    ttk.Checkbutton(fr_refine_flags, text="联网检索", variable=web_search_var).pack(side=tk.LEFT, padx=(12, 0))
+
+    def _write_runtime_config(out_dir: Path) -> Path | None:
+        """
+        将 GUI 上的 refine 开关落到一个运行时 YAML，并把路径传给 refine 流程。
+        仅覆盖 refine.use_kb / refine.web_search；其余沿用默认配置。
+        """
+        try:
+            cfg = load_config(None)
+        except Exception:
+            cfg = {}
+        if not isinstance(cfg, dict):
+            cfg = {}
+        rcfg = dict(cfg.get("refine") or {})
+        rcfg["stream_refine"] = bool(stream_refine_var.get())
+        rcfg["use_kb"] = bool(use_kb_var.get())
+        rcfg["web_search"] = bool(web_search_var.get())
+        cfg["refine"] = rcfg
+        p = (out_dir / "_runtime_config.yaml").resolve()
+        p.write_text(yaml.safe_dump(cfg, allow_unicode=True, sort_keys=False), encoding="utf-8")
+        return p
 
     root.mainloop()
     _LOG_QUEUE = None
