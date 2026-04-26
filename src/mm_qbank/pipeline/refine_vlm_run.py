@@ -48,6 +48,48 @@ def _tihao_sort_key(x: dict[str, Any]) -> tuple[int, int, str]:
     return (0, n, s)
 
 
+def _tihao_base(s: str) -> str:
+    """把 12-1 / 12a / 12（1）等映射回基础题号 '12'；取不到则回退原字符串。"""
+    t = (s or "").strip()
+    m = _TIHAO_NUM.search(t)
+    return (m.group(0) if m else t)
+
+
+def _normalize_out_item_flexible(
+    merged_map: dict[str, dict[str, str]], raw: dict[str, Any]
+) -> dict[str, Any]:
+    """
+    允许 LLM 拆分题号（如 12-1/12-2）：
+    - 若 raw 提供了 原问题/原解析，则以 raw 为准（用于“多题混入”拆分后分别落行）
+    - 否则用 merged_map[基础题号] 回填
+    - `修正状态` 仍按“修正后问题/解析 vs 原问题/解析”判断
+    """
+    tihao = str(raw.get("题号", "") or "").strip()
+    base = _tihao_base(tihao)
+    m = merged_map.get(base, {"题号": base, "问题": "", "解析": ""})
+    原问 = str(raw.get("原问题") or "").strip() or str(m.get("问题") or "").strip()
+    原析 = str(raw.get("原解析") or "").strip() or str(m.get("解析") or "").strip()
+
+    修q_raw = str(raw.get("修正后问题", "") or "").strip()
+    修a_raw = str(raw.get("修正后解析", "") or "").strip()
+    修q = 修q_raw or 原问
+    修a = 修a_raw or 原析
+    changed = _text_norm(修q) != _text_norm(原问) or _text_norm(修a) != _text_norm(原析)
+
+    return {
+        "题号": tihao or str(raw.get("题号", base) or base).strip() or base,
+        "原问题": 原问,
+        "原解析": 原析,
+        "修正后问题": 修q_raw if changed else "",
+        "修正问题原因": (str(raw.get("修正问题原因", "") or "").strip() if changed else ""),
+        "修正问题参考来源": (str(raw.get("修正问题参考来源", "") or "").strip() if changed else ""),
+        "修正后解析": 修a_raw if changed else "",
+        "修正解析原因": (str(raw.get("修正解析原因", "") or "").strip() if changed else ""),
+        "修正解析参考来源": (str(raw.get("修正解析参考来源", "") or "").strip() if changed else ""),
+        "修正状态": changed,
+    }
+
+
 def _iter_kb_roots(kb_parent: Path) -> list[Path]:
     kb_parent = kb_parent.resolve()
     if not kb_parent.is_dir():
@@ -360,6 +402,11 @@ def run_refine_vlm_merged(
 
         rsys = refine_system()
         total = len(merged_all)
+        merged_map: dict[str, dict[str, str]] = {
+            str(x.get("题号") or "").strip(): {"题号": str(x.get("题号") or "").strip(), "问题": str(x.get("问题") or ""), "解析": str(x.get("解析") or "")}
+            for x in merged_all
+            if str(x.get("题号") or "").strip()
+        }
 
         raw_max_workers = rcfg.get("max_workers")
 
@@ -490,15 +537,23 @@ def run_refine_vlm_merged(
             )
             out_items = _parse_refine_response(content)
             flat_part: list[dict[str, Any]] = []
-            for j, m in enumerate(chunk_simple):
-                oi: dict[str, Any] = out_items[j] if j < len(out_items) else {}
-                row = _normalize_out_item(m, oi)
-                meta = chunk[j]
+            # 允许 LLM 拆分题号（同一输入题块输出多行）
+            for oi in out_items:
+                tihao = str(oi.get("题号", "") or "").strip()
+                base = _tihao_base(tihao)
+                meta = agg.get(base)
+                if meta is None:
+                    continue
+                m = merged_map.get(base, {"题号": base, "问题": "", "解析": ""})
+                row = _normalize_out_item_flexible({base: m}, oi)
                 if kb_roots:
-                    # 保留离线参考列（不受 changed 清空规则影响）
-                    row["离线参考1"] = str(m.get("离线参考1") or "")
-                    row["离线参考2"] = str(m.get("离线参考2") or "")
-                    row["离线参考3"] = str(m.get("离线参考3") or "")
+                    # 若输入题块带离线参考列，则透传（拆分后每行沿用同题块参考）
+                    for cm in chunk_simple:
+                        if str(cm.get("题号") or "").strip() == base:
+                            row["离线参考1"] = str(cm.get("离线参考1") or "")
+                            row["离线参考2"] = str(cm.get("离线参考2") or "")
+                            row["离线参考3"] = str(cm.get("离线参考3") or "")
+                            break
                 row["page_id"] = ",".join(meta.get("page_ids") or [])
                 imgs = meta.get("source_images") or []
                 row["source_image"] = imgs[0] if imgs else ""
@@ -516,15 +571,15 @@ def run_refine_vlm_merged(
                     )
                 except Exception as e:  # noqa: BLE001
                     _log.warning("追加写 CSV 失败 tihao=%s: %s", row.get("题号", ""), e)
-                    # 进度回调：按“题”为单位
-                    if on_refine_progress is not None:
-                        try:
-                            with prog_lock:
-                                n_done_total += 1
-                                nd = n_done_total
-                            on_refine_progress(int(nd), int(total))
-                        except Exception:  # noqa: BLE001
-                            pass
+                # 进度回调：每处理一题更新一次（须在 try/except 之外，否则 CSV 成功时从不回调）
+                if on_refine_progress is not None:
+                    try:
+                        with prog_lock:
+                            n_done_total += 1
+                            nd = n_done_total
+                        on_refine_progress(int(nd), int(max(total, nd)))
+                    except Exception:  # noqa: BLE001
+                        pass
             return (st, flat_part)
 
         if max_rw <= 1 or n_batches <= 1:
@@ -1152,15 +1207,28 @@ def run_refine_from_compose_jsonl(
             )
             out_items = _parse_refine_response(content)
             flat_part: list[dict[str, Any]] = []
-            for j, m in enumerate(chunk_simple):
-                oi: dict[str, Any] = out_items[j] if j < len(out_items) else {}
-                row = _normalize_out_item(m, oi)
-                meta = chunk[j]
+            merged_map_batch: dict[str, dict[str, str]] = {
+                str(x.get("题号") or "").strip(): {"题号": str(x.get("题号") or "").strip(), "问题": str(x.get("问题") or ""), "解析": str(x.get("解析") or "")}
+                for x in chunk
+                if str(x.get("题号") or "").strip()
+            }
+            meta_map_batch: dict[str, dict[str, Any]] = {
+                str(x.get("题号") or "").strip(): x for x in chunk if str(x.get("题号") or "").strip()
+            }
+            for oi in out_items:
+                tihao = str(oi.get("题号", "") or "").strip()
+                base = _tihao_base(tihao)
+                meta = meta_map_batch.get(base)
+                if meta is None:
+                    continue
+                row = _normalize_out_item_flexible(merged_map_batch, oi)
                 if kb_roots:
-                    # 保留离线参考列（不受 changed 清空规则影响）
-                    row["离线参考1"] = str(m.get("离线参考1") or "")
-                    row["离线参考2"] = str(m.get("离线参考2") or "")
-                    row["离线参考3"] = str(m.get("离线参考3") or "")
+                    for cm in chunk_simple:
+                        if str(cm.get("题号") or "").strip() == base:
+                            row["离线参考1"] = str(cm.get("离线参考1") or "")
+                            row["离线参考2"] = str(cm.get("离线参考2") or "")
+                            row["离线参考3"] = str(cm.get("离线参考3") or "")
+                            break
                 row["page_id"] = ",".join(meta.get("page_ids") or [])
                 imgs = meta.get("source_images") or []
                 row["source_image"] = imgs[0] if imgs else ""
@@ -1176,14 +1244,14 @@ def run_refine_from_compose_jsonl(
                     )
                 except Exception as e:  # noqa: BLE001
                     _log.warning("追加写 CSV 失败 tihao=%s: %s", row.get("题号", ""), e)
-                    if on_refine_progress is not None:
-                        try:
-                            with prog_lock:
-                                n_done_total += 1
-                                nd = n_done_total
-                            on_refine_progress(int(nd), int(total))
-                        except Exception:  # noqa: BLE001
-                            pass
+                if on_refine_progress is not None:
+                    try:
+                        with prog_lock:
+                            n_done_total += 1
+                            nd = n_done_total
+                        on_refine_progress(int(nd), int(max(total, nd)))
+                    except Exception:  # noqa: BLE001
+                        pass
             return (st, flat_part)
 
         if max_rw <= 1 or n_batches <= 1:
