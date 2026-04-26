@@ -13,8 +13,6 @@ from typing import Any, cast
 import math
 
 from mm_qbank.config import load_config, llm_text_settings, project_root
-from mm_qbank.kb.embed import Embedder
-from mm_qbank.kb.index_faiss import load_chunks_jsonl, load_faiss_index, load_kb_manifest, search
 from mm_qbank.io.csv_out import append_refined_rows_to_csv
 from mm_qbank.io.xlsx_out import write_refined_rows_to_xlsx
 from mm_qbank.llm.client import OpenAICompatClient
@@ -88,87 +86,6 @@ def _normalize_out_item_flexible(
         "修正解析参考来源": (str(raw.get("修正解析参考来源", "") or "").strip() if changed else ""),
         "修正状态": changed,
     }
-
-
-def _iter_kb_roots(kb_parent: Path) -> list[Path]:
-    kb_parent = kb_parent.resolve()
-    if not kb_parent.is_dir():
-        return []
-    out: list[Path] = []
-    for p in kb_parent.iterdir():
-        if not p.is_dir():
-            continue
-        if (p / "kb_manifest.json").is_file() and (p / "chunks.jsonl").is_file() and (p / "index.faiss").is_file():
-            out.append(p.resolve())
-    return sorted(out)
-
-
-def _kb_display_name(kb_root: Path) -> str:
-    try:
-        mf = load_kb_manifest((kb_root / "kb_manifest.json").resolve())
-        v = str(mf.get("kb_display_name") or "").strip()
-        if v:
-            return v
-    except Exception:
-        pass
-    return kb_root.name
-
-
-def _kb_model_name(kb_root: Path) -> str:
-    mf = load_kb_manifest((kb_root / "kb_manifest.json").resolve())
-    m = str(mf.get("model_name") or "").strip()
-    if not m:
-        raise ValueError(f"KB manifest 缺少 model_name: {kb_root}")
-    return m
-
-
-def _retrieve_topk_across_kbs(*, kb_roots: list[Path], query: str, topk: int = 3) -> list[dict[str, str]]:
-    """
-    返回最多 topk 条离线参考，每条包含：
-    - source: "书名 | pdf | p.X | score=..."
-    - text: chunk 原文（不截断）
-
-    注意：若存在多种 embedding 模型，score 不可比；此处选择“数量最多”的模型作为主模型。
-    """
-    topk = max(1, int(topk))
-    if not kb_roots:
-        return []
-
-    model_groups: dict[str, list[Path]] = {}
-    for r in kb_roots:
-        try:
-            m = _kb_model_name(r)
-        except Exception:
-            continue
-        model_groups.setdefault(m, []).append(r)
-    if not model_groups:
-        return []
-
-    primary_model = sorted(model_groups.items(), key=lambda kv: len(kv[1]), reverse=True)[0][0]
-    emb = Embedder(primary_model).embed_texts([query], batch_size=1)[0]
-
-    hits_all: list[dict[str, Any]] = []
-    for kb_root in model_groups.get(primary_model, []):
-        try:
-            idx = load_faiss_index((kb_root / "index.faiss").resolve())
-            chunks = load_chunks_jsonl((kb_root / "chunks.jsonl").resolve())
-            hits = search(index=idx, chunks=chunks, query_embedding=emb, topk=topk)
-            book = _kb_display_name(kb_root)
-            for h in hits:
-                c = h.chunk
-                hits_all.append(
-                    {
-                        "score": float(h.score),
-                        "source": f"{book} | {c.pdf_name} | p.{int(c.page_index) + 1} | score={h.score:.3f}",
-                        "text": c.text,
-                    }
-                )
-        except Exception:
-            continue
-    hits_all.sort(key=lambda x: x.get("score", 0.0), reverse=True)
-    out = [{"source": str(h["source"]), "text": str(h["text"])} for h in hits_all[:topk]]
-    return out
-
 
 
 def _cap_workers(n_tasks: int, raw: Any) -> int:
@@ -289,7 +206,6 @@ def run_refine_vlm_merged(
         (rcfg.get("model") or tl.get("text_model") or "gpt-4o-mini")
     )
     web_search = bool(rcfg.get("web_search", False))
-    use_kb = bool(rcfg.get("use_kb", True))
     temp = float(rcfg.get("temperature", 0.2))
     timeout = float(rcfg.get("timeout_seconds", 180.0))
 
@@ -390,16 +306,6 @@ def run_refine_vlm_merged(
     if not merged_all:
         _log.warning("跨页聚合后无可修正条目")
     else:
-        # 离线知识库：是否启用与 web_search 脱钩（可同时开启）。
-        # 用途：为每题检索 Top3 参考片段，注入 prompt 并导出到离线参考列。
-        kb_roots: list[Path] = []
-        if use_kb:
-            kb_roots = _iter_kb_roots((project_root() / "data" / "kb").resolve())
-            if kb_roots:
-                _log.info("离线模式：检测到离线 KB 数量=%s，将为每题检索 Top3 参考片段", len(kb_roots))
-            else:
-                _log.info("离线模式：未检测到离线 KB（data/kb 下无有效 KB 目录），将不附带离线参考片段")
-
         rsys = refine_system()
         total = len(merged_all)
         merged_map: dict[str, dict[str, str]] = {
@@ -441,50 +347,12 @@ def run_refine_vlm_merged(
 
         def _refine_one_batch(batch_idx: int, st: int, ed: int) -> tuple[int, list[dict[str, Any]]]:
             chunk = merged_all[st:ed]
-            chunk_simple: list[dict[str, Any]] = []
-            offline_blocks: list[str] = []
-            for x in chunk:
-                base_item: dict[str, Any] = {"题号": x["题号"], "问题": x["问题"], "解析": x["解析"]}
-                if kb_roots:
-                    refs = _retrieve_topk_across_kbs(kb_roots=kb_roots, query=str(x.get("问题") or ""), topk=3)
-                    # 导出字段：三个独立列（每列是“全文原文 + [n] 引用标记 + 来源信息”）
-                    rcols = []
-                    for i, r in enumerate(refs[:3], start=1):
-                        # 注意：这里不截断，尽量保留 chunk 原文全文；并把 [i] 标记放在全文开头，便于 LLM/人工引用。
-                        rcols.append(f"[{i}] {r.get('source','')}\n{r.get('text','')}".strip())
-                    while len(rcols) < 3:
-                        rcols.append("")
-                    base_item["离线参考1"] = rcols[0]
-                    base_item["离线参考2"] = rcols[1]
-                    base_item["离线参考3"] = rcols[2]
-                chunk_simple.append(base_item)
-
-            # 直接把三列“离线参考全文”（已含 [1]/[2]/[3]）注入 prompt。
-            # 旧规则：当 web_search=False 时限制“参考来源”只能引用离线 KB 编号。
-            if kb_roots:
-                for it in chunk_simple:
-                    r1 = str(it.get("离线参考1") or "")
-                    r2 = str(it.get("离线参考2") or "")
-                    r3 = str(it.get("离线参考3") or "")
-                    if any([r1, r2, r3]):
-                        offline_blocks.append(("\n".join([f"题号 {it['题号']}：", r1, r2, r3]).strip()))
-
+            chunk_simple: list[dict[str, Any]] = [
+                {"题号": x["题号"], "问题": x["问题"], "解析": x["解析"]} for x in chunk
+            ]
             up = refine_user_payload(
                 page_id=f"跨页合并 {batch_idx}", merged=chunk_simple, web_search=web_search
             )
-            if offline_blocks:
-                constraint = ""
-                if not web_search:
-                    constraint = (
-                        "\n\n要求：修正问题参考来源/修正解析参考来源 只能引用上述离线片段编号（如 [1]、[2]、[3]），"
-                        "不得引用网络资料或编造书名版次。\n\n"
-                    )
-                up = (
-                    "【离线知识库检索Top3（每题，可引用为 [1]/[2]/[3]）】\n"
-                    + "\n\n".join(offline_blocks)
-                    + constraint
-                    + up
-                )
             c = OpenAICompatClient(
                 api_key=str(tl.get("api_key")),
                 base_url=tl.get("base_url") or None,
@@ -546,14 +414,6 @@ def run_refine_vlm_merged(
                     continue
                 m = merged_map.get(base, {"题号": base, "问题": "", "解析": ""})
                 row = _normalize_out_item_flexible({base: m}, oi)
-                if kb_roots:
-                    # 若输入题块带离线参考列，则透传（拆分后每行沿用同题块参考）
-                    for cm in chunk_simple:
-                        if str(cm.get("题号") or "").strip() == base:
-                            row["离线参考1"] = str(cm.get("离线参考1") or "")
-                            row["离线参考2"] = str(cm.get("离线参考2") or "")
-                            row["离线参考3"] = str(cm.get("离线参考3") or "")
-                            break
                 row["page_id"] = ",".join(meta.get("page_ids") or [])
                 imgs = meta.get("source_images") or []
                 row["source_image"] = imgs[0] if imgs else ""
@@ -562,7 +422,7 @@ def run_refine_vlm_merged(
                 # 关键：LLM 每完成一题，就立刻追加写入 CSV，并记录日志（并发下加锁保证文件一致性）
                 try:
                     with csv_lock:
-                        append_refined_rows_to_csv(cout, [row], include_offline_refs=use_kb)
+                        append_refined_rows_to_csv(cout, [row])
                     _log.info(
                         "refine-done tihao=%s changed=%s -> csv=%s",
                         row.get("题号", ""),
@@ -604,7 +464,7 @@ def run_refine_vlm_merged(
         "\n".join(json.dumps(x, ensure_ascii=False) for x in flat) + ("\n" if flat else ""),
         encoding="utf-8",
     )
-    write_refined_rows_to_xlsx(xout, flat, include_offline_refs=use_kb)
+    write_refined_rows_to_xlsx(xout, flat)
     return {
         "n_rows": len(flat),
         "out_jsonl": str(jout),
@@ -646,7 +506,6 @@ def run_vlm_text_and_refine_streaming(
         (rcfg.get("model") or tl.get("text_model") or "gpt-4o-mini")
     )
     web_search = bool(rcfg.get("web_search", False))
-    use_kb = bool(rcfg.get("use_kb", True))
     temp = float(rcfg.get("temperature", 0.2))
     timeout = float(rcfg.get("timeout_seconds", 180.0))
     batch_size = int(rcfg.get("batch_size", 20) or 20)
@@ -763,85 +622,7 @@ def run_vlm_text_and_refine_streaming(
                 del ready[: min(batch_size, len(chunk))]
                 chunk_simple = [{"题号": x["题号"], "问题": x["问题"], "解析": x["解析"]} for x in chunk]
                 _log.info("stream-refine 请求 batch=%s 条=%s", batch_idx, len(chunk_simple))
-                # streaming 路径也支持“use_kb 与 web_search 脱钩”：
-                # 若启用 KB，则为每题检索 Top3 并注入 prompt；当 web_search=False 时限制引用离线编号。
-                if use_kb:
-                    kb_roots = _iter_kb_roots((project_root() / "data" / "kb").resolve())
-                else:
-                    kb_roots = []
-                if kb_roots:
-                    offline_blocks: list[str] = []
-                    chunk_aug: list[dict[str, str]] = []
-                    for x in chunk_simple:
-                        refs = _retrieve_topk_across_kbs(kb_roots=kb_roots, query=str(x.get("问题") or ""), topk=3)
-                        rcols = []
-                        for i, r in enumerate(refs[:3], start=1):
-                            rcols.append(f"[{i}] {r.get('source','')}\n{r.get('text','')}".strip())
-                        while len(rcols) < 3:
-                            rcols.append("")
-                        chunk_aug.append({**x, "离线参考1": rcols[0], "离线参考2": rcols[1], "离线参考3": rcols[2]})
-                        if any(rcols):
-                            offline_blocks.append(("\n".join([f"题号 {x['题号']}：", rcols[0], rcols[1], rcols[2]]).strip()))
-                    up2 = refine_user_payload(page_id=f"stream {batch_idx}", merged=chunk_aug, web_search=web_search)
-                    if offline_blocks:
-                        constraint = ""
-                        if not web_search:
-                            constraint = (
-                                "\n\n要求：修正问题参考来源/修正解析参考来源 只能引用上述离线片段编号（如 [1]、[2]、[3]），"
-                                "不得引用网络资料或编造书名版次。\n\n"
-                            )
-                        up2 = (
-                            "【离线知识库检索Top3（每题，可引用为 [1]/[2]/[3]）】\n"
-                            + "\n\n".join(offline_blocks)
-                            + constraint
-                            + up2
-                        )
-                    # 复用 _refine_batch 的逻辑：临时替换 payload，避免改动太大
-                    rsys = refine_system()
-                    c = OpenAICompatClient(
-                        api_key=str(tl.get("api_key")),
-                        base_url=tl.get("base_url") or None,
-                        default_headers=default_headers,
-                    )
-
-                    def _call_once(tout: float) -> str:
-                        try:
-                            return c.chat_text_json(
-                                model=text_model,
-                                messages=[{"role": "system", "content": rsys}, {"role": "user", "content": up2}],
-                                temperature=temp,
-                                timeout=float(tout),
-                            )
-                        except Exception:  # noqa: BLE001
-                            return c.chat_text_json(
-                                model=text_model,
-                                messages=[{"role": "system", "content": rsys}, {"role": "user", "content": up2}],
-                                temperature=temp,
-                                timeout=None,
-                            )
-
-                    content = call_with_retries_timeout(
-                        _call_once,
-                        tries=3,
-                        base_timeout_s=float(timeout),
-                        base_sleep_s=1.0,
-                        on_retry=lambda att, e, s, nt: _log.warning(
-                            "LLM HTTP 失败将重试 stream_batch=%s attempt=%s/3 sleep=%.2fs next_timeout=%.1fs err=%s: %s",
-                            batch_idx,
-                            att + 1,
-                            s,
-                            nt,
-                            type(e).__name__,
-                            e,
-                        ),
-                    )
-                    out_items = _parse_refine_response(content)
-                    refined = []
-                    for j, m in enumerate(chunk_simple):
-                        oi: dict[str, Any] = out_items[j] if j < len(out_items) else {}
-                        refined.append(_normalize_out_item(m, oi))
-                else:
-                    refined = _refine_batch(batch_idx, chunk_simple)
+                refined = _refine_batch(batch_idx, chunk_simple)
                 for rrow, meta in zip(refined, chunk, strict=False):
                     rrow["page_id"] = ",".join(meta.get("page_ids") or [])
                     imgs = meta.get("source_images") or []
@@ -849,7 +630,7 @@ def run_vlm_text_and_refine_streaming(
                     flat.append(rrow)
                     try:
                         with csv_lock:
-                            append_refined_rows_to_csv(cout, [rrow], include_offline_refs=use_kb)
+                            append_refined_rows_to_csv(cout, [rrow])
                         _log.info(
                             "refine-done tihao=%s changed=%s -> csv=%s",
                             rrow.get("题号", ""),
@@ -953,7 +734,7 @@ def run_vlm_text_and_refine_streaming(
         "\n".join(json.dumps(x, ensure_ascii=False) for x in flat) + ("\n" if flat else ""),
         encoding="utf-8",
     )
-    write_refined_rows_to_xlsx(xout, flat, include_offline_refs=use_kb)
+    write_refined_rows_to_xlsx(xout, flat)
     return {
         **vlm_summary,
         "mode": "vlm+refine_stream",
@@ -1004,7 +785,6 @@ def run_refine_from_compose_jsonl(
         (rcfg.get("model") or tl.get("text_model") or "gpt-4o-mini")
     )
     web_search = bool(rcfg.get("web_search", False))
-    use_kb = bool(rcfg.get("use_kb", True))
     temp = float(rcfg.get("temperature", 0.2))
     timeout = float(rcfg.get("timeout_seconds", 180.0))
 
@@ -1087,16 +867,6 @@ def run_refine_from_compose_jsonl(
     if not merged_all:
         _log.warning("compose_jsonl 聚合后无可修正条目")
     else:
-        # 离线知识库：是否启用与 web_search 脱钩（可同时开启）。
-        # 用途：为每题检索 Top3 参考片段，注入 prompt 并导出到离线参考列。
-        kb_roots: list[Path] = []
-        if use_kb:
-            kb_roots = _iter_kb_roots((project_root() / "data" / "kb").resolve())
-            if kb_roots:
-                _log.info("离线模式：检测到离线 KB 数量=%s，将为每题检索 Top3 参考片段", len(kb_roots))
-            else:
-                _log.info("离线模式：未检测到离线 KB（data/kb 下无有效 KB 目录），将不附带离线参考片段")
-
         rsys = refine_system()
         total = len(merged_all)
         raw_max_workers = rcfg.get("max_workers")
@@ -1128,44 +898,10 @@ def run_refine_from_compose_jsonl(
 
         def _refine_one_batch(batch_idx: int, st: int, ed: int) -> tuple[int, list[dict[str, Any]]]:
             chunk = merged_all[st:ed]
-            chunk_simple: list[dict[str, Any]] = []
-            offline_blocks: list[str] = []
-            for x in chunk:
-                refs = (
-                    _retrieve_topk_across_kbs(kb_roots=kb_roots, query=str(x.get("问题") or ""), topk=3)
-                    if kb_roots
-                    else []
-                )
-                rcols = []
-                for i, r in enumerate(refs[:3], start=1):
-                    rcols.append(f"[{i}] {r.get('source','')}\n{r.get('text','')}".strip())
-                while len(rcols) < 3:
-                    rcols.append("")
-                base_item: dict[str, Any] = {"题号": x["题号"], "问题": x["问题"], "解析": x["解析"]}
-                if kb_roots:
-                    base_item["离线参考1"] = rcols[0]
-                    base_item["离线参考2"] = rcols[1]
-                    base_item["离线参考3"] = rcols[2]
-                    if (not web_search) and any(rcols):
-                        offline_blocks.append(
-                            ("\n".join([f"题号 {x['题号']}：", rcols[0], rcols[1], rcols[2]]).strip())
-                        )
-                chunk_simple.append(base_item)
-
+            chunk_simple: list[dict[str, Any]] = [
+                {"题号": x["题号"], "问题": x["问题"], "解析": x["解析"]} for x in chunk
+            ]
             up = refine_user_payload(page_id=f"compose {batch_idx}", merged=chunk_simple, web_search=web_search)
-            if offline_blocks:
-                constraint = ""
-                if not web_search:
-                    constraint = (
-                        "\n\n要求：修正问题参考来源/修正解析参考来源 只能引用上述离线片段编号（如 [1]、[2]、[3]），"
-                        "不得引用网络资料或编造书名版次。\n\n"
-                    )
-                up = (
-                    "【离线知识库检索Top3（每题，可引用为 [1]/[2]/[3]）】\n"
-                    + "\n\n".join(offline_blocks)
-                    + constraint
-                    + up
-                )
             c = OpenAICompatClient(
                 api_key=str(tl.get("api_key")),
                 base_url=tl.get("base_url") or None,
@@ -1222,20 +958,13 @@ def run_refine_from_compose_jsonl(
                 if meta is None:
                     continue
                 row = _normalize_out_item_flexible(merged_map_batch, oi)
-                if kb_roots:
-                    for cm in chunk_simple:
-                        if str(cm.get("题号") or "").strip() == base:
-                            row["离线参考1"] = str(cm.get("离线参考1") or "")
-                            row["离线参考2"] = str(cm.get("离线参考2") or "")
-                            row["离线参考3"] = str(cm.get("离线参考3") or "")
-                            break
                 row["page_id"] = ",".join(meta.get("page_ids") or [])
                 imgs = meta.get("source_images") or []
                 row["source_image"] = imgs[0] if imgs else ""
                 flat_part.append(row)
                 try:
                     with csv_lock:
-                        append_refined_rows_to_csv(cout, [row], include_offline_refs=use_kb)
+                        append_refined_rows_to_csv(cout, [row])
                     _log.info(
                         "refine-done tihao=%s changed=%s -> csv=%s",
                         row.get("题号", ""),
@@ -1276,7 +1005,7 @@ def run_refine_from_compose_jsonl(
         "\n".join(json.dumps(x, ensure_ascii=False) for x in flat) + ("\n" if flat else ""),
         encoding="utf-8",
     )
-    write_refined_rows_to_xlsx(xout, flat, include_offline_refs=use_kb)
+    write_refined_rows_to_xlsx(xout, flat)
     return {
         "n_rows": len(flat),
         "out_jsonl": str(jout),

@@ -67,7 +67,6 @@ mm-qbank-gui
 powershell -ExecutionPolicy Bypass -File .\build.ps1
 ```
 
-- 默认**不会删除**已有的 `dist/mm-qbank-gui/`：只会覆盖打包生成的文件，你在该目录里手动放的 `configs/`、`.env`、`data/` 等会保留。若要全新清空再打一次，用：`.\build.ps1 -CleanDist`。
 - 产物是 **onedir**：请把 `dist/mm-qbank-gui/` 整个文件夹拷贝到其它机器运行。
 - 运行时会从 **exe 同目录**读取 `configs/` 与 `.env`（如需改 key/模型，放一个 `.env` 在 exe 旁边即可）。
 

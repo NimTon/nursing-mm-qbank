@@ -22,8 +22,6 @@ _BASE_REFINED_CSV_COLUMNS: Sequence[str] = (
     "source_image",
 )
 
-_OFFLINE_KB_COLUMNS: Sequence[str] = ("离线参考1", "离线参考2", "离线参考3")
-
 
 def _needs_header(path: Path) -> bool:
     if not path.exists():
@@ -34,9 +32,7 @@ def _needs_header(path: Path) -> bool:
         return True
 
 
-def append_refined_rows_to_csv(
-    path: Path, rows: Iterable[dict[str, Any]], *, include_offline_refs: bool = True
-) -> int:
+def append_refined_rows_to_csv(path: Path, rows: Iterable[dict[str, Any]]) -> int:
     """
     追加写入 refined 行到 CSV（UTF-8-SIG，便于 Excel 打开）。
     若文件不存在或为空则先写表头。
@@ -46,9 +42,7 @@ def append_refined_rows_to_csv(
 
     wrote = 0
     write_header = _needs_header(path)
-    columns = (
-        tuple(_BASE_REFINED_CSV_COLUMNS) + tuple(_OFFLINE_KB_COLUMNS) if include_offline_refs else tuple(_BASE_REFINED_CSV_COLUMNS)
-    )
+    columns = tuple(_BASE_REFINED_CSV_COLUMNS)
     with path.open("a", encoding="utf-8-sig", newline="") as f:
         w = csv.DictWriter(f, fieldnames=list(columns), extrasaction="ignore")
         if write_header:

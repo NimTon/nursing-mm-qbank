@@ -44,8 +44,5 @@ refine:
   # - false：顺序模式（先 VLM 全跑完落盘，再跨页合并题号→批量修正）
   # - true ：流式模式（VLM 每页完成就进入题号缓冲，凑齐同题问题+解析即入批，满批就请求修正并流式写 CSV）
   stream_refine: false
-  # 是否注入离线知识库（data/kb 下的 FAISS KB）检索片段到 prompt。
-  # 与 web_search 脱钩：两者可同时为 true（同时具备“离线 KB 参考” + “联网搜索”）。
-  use_kb: false
   web_search: true
   timeout_seconds: 300.0

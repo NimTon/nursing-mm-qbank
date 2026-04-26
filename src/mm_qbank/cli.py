@@ -6,8 +6,6 @@ import logging
 from pathlib import Path
 
 from mm_qbank.logging_utils import configure_logging
-from mm_qbank.kb.kb_build import build_kb_from_pdf_dir
-from mm_qbank.kb.kb_store import kb_dir_from_arg, load_kb
 from mm_qbank.pipeline.llm_compose_run import run_llm_compose_manifest
 from mm_qbank.pipeline.refine_vlm_run import run_refine_from_compose_jsonl, run_refine_vlm_merged
 from mm_qbank.pipeline.vlm_text_run import run_vlm_text_only
@@ -114,27 +112,6 @@ def main() -> None:
     llm.add_argument("--config", dest="config", type=Path, default=None, help="覆盖默认 configs/default.yaml")
     llm.add_argument("--model", dest="model", type=str, default=None, help="覆盖环境变量 LLM_MODEL")
 
-    kb = sub.add_parser(
-        "kb-build",
-        parents=[parent],
-        help="离线构建 PDF 知识库（RAG）：PDF→切块→本地 embedding→FAISS",
-    )
-    kb.add_argument("--pdf-dir", type=Path, required=True, help="PDF 目录（递归扫描 *.pdf）")
-    kb.add_argument("--kb", type=str, required=True, help="知识库名称或路径（默认 data/kb/<name>）")
-    kb.add_argument("--model", type=str, default="BAAI/bge-small-zh-v1.5", help="sentence-transformers 模型名")
-    kb.add_argument("--chunk-chars", type=int, default=900)
-    kb.add_argument("--overlap", type=int, default=120)
-    kb.add_argument("--embed-batch", type=int, default=32)
-
-    kq = sub.add_parser(
-        "kb-query",
-        parents=[parent],
-        help="查询知识库 TopK（调试检索命中）",
-    )
-    kq.add_argument("--kb", type=str, required=True, help="知识库名称或路径")
-    kq.add_argument("--q", type=str, required=True, help="查询文本")
-    kq.add_argument("--topk", type=int, default=5)
-
     verify = sub.add_parser(
         "verify-config",
         parents=[parent],
@@ -188,32 +165,6 @@ def main() -> None:
             model=args.model,
         )
         print(json.dumps(summary, ensure_ascii=False, indent=2))
-    elif args.cmd == "kb-build":
-        kb_root = kb_dir_from_arg(args.kb)
-        summary = build_kb_from_pdf_dir(
-            pdf_dir=args.pdf_dir,
-            kb_root=kb_root,
-            model_name=args.model,
-            chunk_chars=args.chunk_chars,
-            overlap=args.overlap,
-            embed_batch_size=args.embed_batch,
-        )
-        print(json.dumps(summary, ensure_ascii=False, indent=2))
-    elif args.cmd == "kb-query":
-        kb_root = kb_dir_from_arg(args.kb)
-        store = load_kb(kb_root=kb_root)
-        hits = store.query(args.q, topk=int(args.topk))
-        out = [
-            {
-                "score": h.score,
-                "pdf": h.chunk.pdf_name,
-                "page": h.chunk.page_index + 1,
-                "id": h.chunk.id,
-                "text_preview": (h.chunk.text[:240] + ("…" if len(h.chunk.text) > 240 else "")),
-            }
-            for h in hits
-        ]
-        print(json.dumps({"kb_root": str(kb_root), "topk": args.topk, "hits": out}, ensure_ascii=False, indent=2))
     elif args.cmd == "verify-config":
         try:
             from mm_qbank.api_verify import run_verify  # type: ignore

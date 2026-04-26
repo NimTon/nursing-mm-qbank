@@ -20,8 +20,6 @@ _BASE_REFINED_XLSX_COLUMNS: Sequence[str] = (
     "修正解析参考来源",
 )
 
-_OFFLINE_KB_COLUMNS: Sequence[str] = ("离线参考1", "离线参考2", "离线参考3")
-
 
 def _as_修正状态_cell(v: Any) -> str:
     if v is True:
@@ -35,9 +33,7 @@ def _as_修正状态_cell(v: Any) -> str:
     return "否"
 
 
-def write_refined_rows_to_xlsx(
-    path: Path, rows: list[dict[str, Any]], *, include_offline_refs: bool = True
-) -> None:
+def write_refined_rows_to_xlsx(path: Path, rows: list[dict[str, Any]]) -> None:
     path = path.resolve()
     path.parent.mkdir(parents=True, exist_ok=True)
     wb = Workbook()
@@ -45,11 +41,7 @@ def write_refined_rows_to_xlsx(
     if ws is None:
         return
     ws.title = "refined"
-    columns = (
-        tuple(_BASE_REFINED_XLSX_COLUMNS) + tuple(_OFFLINE_KB_COLUMNS)
-        if include_offline_refs
-        else tuple(_BASE_REFINED_XLSX_COLUMNS)
-    )
+    columns = tuple(_BASE_REFINED_XLSX_COLUMNS)
     for c, h in enumerate(columns, start=1):
         ws.cell(row=1, column=c, value=h)
     for r, row in enumerate(rows, start=2):
