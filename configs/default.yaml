@@ -44,5 +44,20 @@ refine:
   # - false：顺序模式（先 VLM 全跑完落盘，再跨页合并题号→批量修正）
   # - true ：流式模式（VLM 每页完成就进入题号缓冲，凑齐同题问题+解析即入批，满批就请求修正并流式写 CSV）
   stream_refine: false
+  # 是否注入离线知识库（data/kb 下的 FAISS KB）检索片段到 prompt。
+  # 与 web_search 脱钩：两者可同时为 true（同时具备“离线 KB 参考” + “联网搜索”）。
+  use_kb: false
+  web_search: true
+  # true：教材向修正与「讲师提醒」在同一次 LLM 调用中输出（改 prompt，不二次请求）
+  lecture_tips_with_refine: true
+  timeout_seconds: 300.0
+
+# 从结果 xlsx 写「讲师提醒」：web_search 仅作用于本功能（与上方 refine.web_search 独立）
+# true 时若 LLM 基址为类 DashScope 可附加联网头（以供应商与控制台为准，是否真联网不保证）
+lecture_tips:
+  model: null
+  batch_size: 1
+  max_workers: 8
+  temperature: 0.35
   web_search: true
   timeout_seconds: 300.0

@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "nursing-mm-qbank"
-version = "0.1.5"
-description = "护理题库：VLM 流式落盘→凑齐题号即触发教材向修正（流式 CSV 断点续跑）→最终导出 xlsx；支持导入 llm_compose_merged.jsonl"
+version = "0.1.6"
+description = "护理题库：导入已导出的结果 xlsx，由 LLM 批注「讲师提醒」（要点/易错/辨析；流式 CSV 断点续跑、另存新表；mm-qbank xlsx-lecture-tips / mm-qbank-gui）"
 requires-python = ">=3.10"
 dependencies = [
   "opencv-python>=4.8.0",

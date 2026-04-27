@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import csv
+import logging
 from pathlib import Path
 from typing import Any, Iterable, Sequence
 
 from mm_qbank.io.xlsx_out import _as_修正状态_cell
+
+_log = logging.getLogger(__name__)
 
 
 _BASE_REFINED_CSV_COLUMNS: Sequence[str] = (
@@ -18,6 +21,7 @@ _BASE_REFINED_CSV_COLUMNS: Sequence[str] = (
     "修正后解析",
     "修正解析原因",
     "修正解析参考来源",
+    "讲师提醒",
     "page_id",
     "source_image",
 )
@@ -43,6 +47,18 @@ def append_refined_rows_to_csv(path: Path, rows: Iterable[dict[str, Any]]) -> in
     wrote = 0
     write_header = _needs_header(path)
     columns = tuple(_BASE_REFINED_CSV_COLUMNS)
+    if not write_header and "讲师提醒" in columns:
+        try:
+            with path.open("r", encoding="utf-8-sig", newline="") as rf:
+                hdr = next(csv.reader(rf), None)
+            if hdr is not None and "讲师提醒" not in hdr:
+                _log.warning(
+                    "已有流式 CSV 表头不含「讲师提醒」，与当前程序列不一致，追加后 Excel 可能错位；建议删除后重跑：%s",
+                    path,
+                )
+        except OSError:
+            pass
+
     with path.open("a", encoding="utf-8-sig", newline="") as f:
         w = csv.DictWriter(f, fieldnames=list(columns), extrasaction="ignore")
         if write_header:

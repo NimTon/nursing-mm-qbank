@@ -18,6 +18,7 @@ _BASE_REFINED_XLSX_COLUMNS: Sequence[str] = (
     "修正后解析",
     "修正解析原因",
     "修正解析参考来源",
+    "讲师提醒",
 )
 
 
@@ -54,6 +55,6 @@ def write_refined_rows_to_xlsx(path: Path, rows: list[dict[str, Any]]) -> None:
             else:
                 ws.cell(row=r, column=c, value=v)
     for c in range(1, len(columns) + 1):
-        w = 14 if c <= 2 else min(50, 14)
+        w = 14 if c <= 2 else (min(50, 22) if c == len(columns) else min(50, 14))
         ws.column_dimensions[get_column_letter(c)].width = w
     wb.save(path)

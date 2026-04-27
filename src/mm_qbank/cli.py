@@ -6,6 +6,7 @@ import logging
 from pathlib import Path
 
 from mm_qbank.logging_utils import configure_logging
+from mm_qbank.pipeline.lecture_tips_run import run_lecture_tips_from_xlsx
 from mm_qbank.pipeline.llm_compose_run import run_llm_compose_manifest
 from mm_qbank.pipeline.refine_vlm_run import run_refine_from_compose_jsonl, run_refine_vlm_merged
 from mm_qbank.pipeline.vlm_text_run import run_vlm_text_only
@@ -19,7 +20,7 @@ def main() -> None:
     parent.add_argument("-q", "--quiet", action="store_true", help="仅警告与错误 (WARNING)")
     parser = argparse.ArgumentParser(
         prog="mm-qbank",
-        description="护理题库：VLM 流式落盘→按题号凑齐即触发教材向修正（流式 CSV 断点续跑）→最终导出 xlsx；支持导入 llm_compose_merged.jsonl",
+        description="护理题库：导入结果 xlsx 批注「讲师提醒」（xlsx-lecture-tips；流式 CSV 续跑、另存新表）",
         parents=[parent],
     )
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -112,6 +113,46 @@ def main() -> None:
     llm.add_argument("--config", dest="config", type=Path, default=None, help="覆盖默认 configs/default.yaml")
     llm.add_argument("--model", dest="model", type=str, default=None, help="覆盖环境变量 LLM_MODEL")
 
+    ltip = sub.add_parser(
+        "xlsx-lecture-tips",
+        parents=[parent],
+        help="从结果 xlsx 批量生成「讲师提醒」列，流式 CSV 断点续跑，另存新表",
+    )
+    ltip.add_argument(
+        "--in-xlsx",
+        dest="in_xlsx",
+        type=Path,
+        required=True,
+        help="已导出的结果表（如 refined_merged.xlsx，含题号/原或修正后问题与解析等）",
+    )
+    ltip.add_argument(
+        "--out-xlsx",
+        dest="out_xlsx",
+        type=Path,
+        default=None,
+        help="输出 xlsx（默认同目录：原名_lecture_tips.xlsx）",
+    )
+    ltip.add_argument(
+        "--out-csv",
+        dest="lecture_csv",
+        type=Path,
+        default=None,
+        help="流式追加 CSV（默认同目录：原名_lecture_tips_stream.csv）",
+    )
+    ltip.add_argument(
+        "--out-jsonl",
+        dest="lecture_jsonl",
+        type=Path,
+        default=None,
+        help="本运行追加产生的 jsonl（仅含本次新写的行，默认同目录）",
+    )
+    ltip.add_argument(
+        "--config", dest="lecture_config", type=Path, default=None, help="覆盖 configs/default.yaml"
+    )
+    ltip.add_argument(
+        "--model", dest="lecture_model", type=str, default=None, help="覆盖 lecture_tips.model 或 LLM_MODEL"
+    )
+
     verify = sub.add_parser(
         "verify-config",
         parents=[parent],
@@ -163,6 +204,16 @@ def main() -> None:
             out_jsonl=args.out_jsonl,
             config_path=args.config,
             model=args.model,
+        )
+        print(json.dumps(summary, ensure_ascii=False, indent=2))
+    elif args.cmd == "xlsx-lecture-tips":
+        summary = run_lecture_tips_from_xlsx(
+            in_xlsx=args.in_xlsx,
+            out_xlsx=args.out_xlsx,
+            out_csv=args.lecture_csv,
+            out_jsonl=args.lecture_jsonl,
+            config_path=args.lecture_config,
+            model=args.lecture_model,
         )
         print(json.dumps(summary, ensure_ascii=False, indent=2))
     elif args.cmd == "verify-config":

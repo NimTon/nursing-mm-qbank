@@ -54,7 +54,10 @@ def _tihao_base(s: str) -> str:
 
 
 def _normalize_out_item_flexible(
-    merged_map: dict[str, dict[str, str]], raw: dict[str, Any]
+    merged_map: dict[str, dict[str, str]],
+    raw: dict[str, Any],
+    *,
+    include_lecture_tips: bool = False,
 ) -> dict[str, Any]:
     """
     允许 LLM 拆分题号（如 12-1/12-2）：
@@ -74,6 +77,9 @@ def _normalize_out_item_flexible(
     修a = 修a_raw or 原析
     changed = _text_norm(修q) != _text_norm(原问) or _text_norm(修a) != _text_norm(原析)
 
+    tip = ""
+    if include_lecture_tips:
+        tip = str(raw.get("讲师提醒", "") or "").strip()
     return {
         "题号": tihao or str(raw.get("题号", base) or base).strip() or base,
         "原问题": 原问,
@@ -85,6 +91,7 @@ def _normalize_out_item_flexible(
         "修正解析原因": (str(raw.get("修正解析原因", "") or "").strip() if changed else ""),
         "修正解析参考来源": (str(raw.get("修正解析参考来源", "") or "").strip() if changed else ""),
         "修正状态": changed,
+        "讲师提醒": tip,
     }
 
 
@@ -137,7 +144,10 @@ def _text_norm(s: str) -> str:
 
 
 def _normalize_out_item(
-    m: dict[str, str], raw: dict[str, Any]
+    m: dict[str, str],
+    raw: dict[str, Any],
+    *,
+    include_lecture_tips: bool = False,
 ) -> dict[str, Any]:
     """以合并表 `m` 为准定「原*」，对模型输出做归一化。
 
@@ -152,6 +162,9 @@ def _normalize_out_item(
     修a = 修a_raw or 原析
     changed = _text_norm(修q) != _text_norm(原问) or _text_norm(修a) != _text_norm(原析)
 
+    tip = ""
+    if include_lecture_tips:
+        tip = str(raw.get("讲师提醒", "") or "").strip()
     out = {
         "题号": str(raw.get("题号", 题) or 题).strip() or 题,
         "原问题": 原问,
@@ -163,6 +176,7 @@ def _normalize_out_item(
         "修正解析原因": (str(raw.get("修正解析原因", "") or "").strip() if changed else ""),
         "修正解析参考来源": (str(raw.get("修正解析参考来源", "") or "").strip() if changed else ""),
         "修正状态": changed,
+        "讲师提醒": tip,
     }
     return out
 
@@ -206,6 +220,7 @@ def run_refine_vlm_merged(
         (rcfg.get("model") or tl.get("text_model") or "gpt-4o-mini")
     )
     web_search = bool(rcfg.get("web_search", False))
+    include_lecture_tips = bool(rcfg.get("lecture_tips_with_refine", False))
     temp = float(rcfg.get("temperature", 0.2))
     timeout = float(rcfg.get("timeout_seconds", 180.0))
 
@@ -306,7 +321,9 @@ def run_refine_vlm_merged(
     if not merged_all:
         _log.warning("跨页聚合后无可修正条目")
     else:
-        rsys = refine_system()
+        if include_lecture_tips:
+            _log.info("已启用 lecture_tips_with_refine：教材向修正与「讲师提醒」同次 LLM 输出")
+        rsys = refine_system(include_lecture_tips=include_lecture_tips)
         total = len(merged_all)
         merged_map: dict[str, dict[str, str]] = {
             str(x.get("题号") or "").strip(): {"题号": str(x.get("题号") or "").strip(), "问题": str(x.get("问题") or ""), "解析": str(x.get("解析") or "")}
@@ -351,7 +368,10 @@ def run_refine_vlm_merged(
                 {"题号": x["题号"], "问题": x["问题"], "解析": x["解析"]} for x in chunk
             ]
             up = refine_user_payload(
-                page_id=f"跨页合并 {batch_idx}", merged=chunk_simple, web_search=web_search
+                page_id=f"跨页合并 {batch_idx}",
+                merged=chunk_simple,
+                web_search=web_search,
+                include_lecture_tips=include_lecture_tips,
             )
             c = OpenAICompatClient(
                 api_key=str(tl.get("api_key")),
@@ -413,7 +433,9 @@ def run_refine_vlm_merged(
                 if meta is None:
                     continue
                 m = merged_map.get(base, {"题号": base, "问题": "", "解析": ""})
-                row = _normalize_out_item_flexible({base: m}, oi)
+                row = _normalize_out_item_flexible(
+                    {base: m}, oi, include_lecture_tips=include_lecture_tips
+                )
                 row["page_id"] = ",".join(meta.get("page_ids") or [])
                 imgs = meta.get("source_images") or []
                 row["source_image"] = imgs[0] if imgs else ""
@@ -424,9 +446,10 @@ def run_refine_vlm_merged(
                     with csv_lock:
                         append_refined_rows_to_csv(cout, [row])
                     _log.info(
-                        "refine-done tihao=%s changed=%s -> csv=%s",
+                        "refine-done tihao=%s changed=%s lecture=%s -> csv=%s",
                         row.get("题号", ""),
                         row.get("修正状态", False),
+                        bool((row.get("讲师提醒") or "").strip()),
                         str(cout),
                     )
                 except Exception as e:  # noqa: BLE001
@@ -472,6 +495,7 @@ def run_refine_vlm_merged(
         "out_xlsx": str(xout),
         "model": text_model,
         "web_search": web_search,
+        "lecture_tips_with_refine": include_lecture_tips,
     }
 
 
@@ -506,6 +530,7 @@ def run_vlm_text_and_refine_streaming(
         (rcfg.get("model") or tl.get("text_model") or "gpt-4o-mini")
     )
     web_search = bool(rcfg.get("web_search", False))
+    include_lecture_tips = bool(rcfg.get("lecture_tips_with_refine", False))
     temp = float(rcfg.get("temperature", 0.2))
     timeout = float(rcfg.get("timeout_seconds", 180.0))
     batch_size = int(rcfg.get("batch_size", 20) or 20)
@@ -560,8 +585,13 @@ def run_vlm_text_and_refine_streaming(
     _n_refined = 0
 
     def _refine_batch(batch_idx: int, chunk_simple: list[dict[str, str]]) -> list[dict[str, Any]]:
-        rsys = refine_system()
-        up = refine_user_payload(page_id=f"stream {batch_idx}", merged=chunk_simple, web_search=web_search)
+        rsys = refine_system(include_lecture_tips=include_lecture_tips)
+        up = refine_user_payload(
+            page_id=f"stream {batch_idx}",
+            merged=chunk_simple,
+            web_search=web_search,
+            include_lecture_tips=include_lecture_tips,
+        )
         c = OpenAICompatClient(
             api_key=str(tl.get("api_key")),
             base_url=tl.get("base_url") or None,
@@ -603,7 +633,7 @@ def run_vlm_text_and_refine_streaming(
         out_rows: list[dict[str, Any]] = []
         for j, m in enumerate(chunk_simple):
             oi: dict[str, Any] = out_items[j] if j < len(out_items) else {}
-            out_rows.append(_normalize_out_item(m, oi))
+            out_rows.append(_normalize_out_item(m, oi, include_lecture_tips=include_lecture_tips))
         return out_rows
 
     def _aggregator() -> None:
@@ -744,6 +774,7 @@ def run_vlm_text_and_refine_streaming(
         "out_xlsx": str(xout),
         "refine_model": text_model,
         "web_search": web_search,
+        "lecture_tips_with_refine": include_lecture_tips,
     }
 
 
@@ -785,6 +816,7 @@ def run_refine_from_compose_jsonl(
         (rcfg.get("model") or tl.get("text_model") or "gpt-4o-mini")
     )
     web_search = bool(rcfg.get("web_search", False))
+    include_lecture_tips = bool(rcfg.get("lecture_tips_with_refine", False))
     temp = float(rcfg.get("temperature", 0.2))
     timeout = float(rcfg.get("timeout_seconds", 180.0))
 
@@ -867,7 +899,9 @@ def run_refine_from_compose_jsonl(
     if not merged_all:
         _log.warning("compose_jsonl 聚合后无可修正条目")
     else:
-        rsys = refine_system()
+        if include_lecture_tips:
+            _log.info("已启用 lecture_tips_with_refine：教材向修正与「讲师提醒」同次 LLM 输出")
+        rsys = refine_system(include_lecture_tips=include_lecture_tips)
         total = len(merged_all)
         raw_max_workers = rcfg.get("max_workers")
         batch_size = int(rcfg.get("batch_size", 20) or 20)
@@ -901,7 +935,12 @@ def run_refine_from_compose_jsonl(
             chunk_simple: list[dict[str, Any]] = [
                 {"题号": x["题号"], "问题": x["问题"], "解析": x["解析"]} for x in chunk
             ]
-            up = refine_user_payload(page_id=f"compose {batch_idx}", merged=chunk_simple, web_search=web_search)
+            up = refine_user_payload(
+                page_id=f"compose {batch_idx}",
+                merged=chunk_simple,
+                web_search=web_search,
+                include_lecture_tips=include_lecture_tips,
+            )
             c = OpenAICompatClient(
                 api_key=str(tl.get("api_key")),
                 base_url=tl.get("base_url") or None,
@@ -957,7 +996,9 @@ def run_refine_from_compose_jsonl(
                 meta = meta_map_batch.get(base)
                 if meta is None:
                     continue
-                row = _normalize_out_item_flexible(merged_map_batch, oi)
+                row = _normalize_out_item_flexible(
+                    merged_map_batch, oi, include_lecture_tips=include_lecture_tips
+                )
                 row["page_id"] = ",".join(meta.get("page_ids") or [])
                 imgs = meta.get("source_images") or []
                 row["source_image"] = imgs[0] if imgs else ""
@@ -966,9 +1007,10 @@ def run_refine_from_compose_jsonl(
                     with csv_lock:
                         append_refined_rows_to_csv(cout, [row])
                     _log.info(
-                        "refine-done tihao=%s changed=%s -> csv=%s",
+                        "refine-done tihao=%s changed=%s lecture=%s -> csv=%s",
                         row.get("题号", ""),
                         row.get("修正状态", False),
+                        bool((row.get("讲师提醒") or "").strip()),
                         str(cout),
                     )
                 except Exception as e:  # noqa: BLE001
@@ -1013,5 +1055,6 @@ def run_refine_from_compose_jsonl(
         "out_xlsx": str(xout),
         "model": text_model,
         "web_search": web_search,
+        "lecture_tips_with_refine": include_lecture_tips,
         "compose_jsonl": str(cpath),
     }

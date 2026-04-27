@@ -22,6 +22,7 @@ def test_write_refined_xlsx_header(tmp_path: Path) -> None:
                 "修正后解析": "A1",
                 "修正解析原因": "r2",
                 "修正解析参考来源": "b2",
+                "讲师提醒": "",
                 "修正状态": True,
             }
         ],

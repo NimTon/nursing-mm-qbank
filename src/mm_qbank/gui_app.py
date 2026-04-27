@@ -3,6 +3,7 @@
 - VLM 整页转写（带预处理：EXIF 纠正 + 自动 0/90/180/270 旋转 + deskew）
 - VLM 结果流式落盘（pages.jsonl 逐页写入）
 - 按题号缓冲：同题「问题+解析」凑齐就触发教材向修正（凑满一批就请求），并流式追加写 CSV 便于断点续跑
+- 结果 xlsx「讲师提醒」与教材向修正共用「联网检索」等 LLM 运行时开关（见界面「LLM 参数」）
 - 最终导出 xlsx/jsonl；也可直接选择 llm_compose_merged.jsonl 仅修正
 
 运行：
@@ -70,6 +71,7 @@ from mm_qbank import __version__
 from mm_qbank.config import load_config, project_root
 from mm_qbank.logging_utils import configure_logging
 from mm_qbank.pipeline.llm_compose_run import run_llm_compose_manifest
+from mm_qbank.pipeline.lecture_tips_run import run_lecture_tips_from_xlsx
 from mm_qbank.pipeline.refine_vlm_run import (
     run_refine_from_compose_jsonl,
     run_refine_vlm_merged,
@@ -197,7 +199,7 @@ def main() -> None:
         logging.getLogger(name).setLevel(logging.INFO)
 
     root = tk.Tk()
-    root.title(f"nursing-mm-qbank v{__version__} · 流式转写与教材向修正")
+    root.title(f"nursing-mm-qbank v{__version__} · 结果 xlsx 批注「讲师提醒」（流式 CSV 续跑）")
     root.geometry("1200x800")
     root.minsize(720, 520)
     # 现代 ttk 主题（优先启用；缺依赖时自动降级）
@@ -269,6 +271,7 @@ def main() -> None:
     is_temp: list[bool] = [False]
     last_out: list[Path | None] = [None]
     compose_jsonl_in: list[Path | None] = [None]
+    xlsx_lecture_in: list[Path | None] = [None]
     # 运行/暂停/取消：与 vlm_text_run 内「页与页之间」协作用；单次模型请求中无法暂停或结束直到该页返回
     run_cancel = threading.Event()
     user_paused: list[bool] = [False]
@@ -281,7 +284,15 @@ def main() -> None:
     fr_top_bar.pack(fill=tk.X)
     fr_top_right = ttk.Frame(fr_top_bar)
     fr_top_right.pack(side=tk.RIGHT, padx=(4, 0))
-    ttk.Label(fr_top_right, text=f"v{__version__}", foreground="#666", font=_font_small).pack(anchor=tk.E)
+    fr_ver = ttk.Frame(fr_top_right)
+    fr_ver.pack(anchor=tk.E)
+    ttk.Label(fr_ver, text=f"v{__version__}", foreground="#666", font=_font_small).pack(side=tk.LEFT, padx=(0, 6))
+    ttk.Label(
+        fr_ver,
+        text="结果表「讲师提醒」",
+        foreground="#666",
+        font=_font_small,
+    ).pack(side=tk.LEFT)
     _mono_mascot: tuple[Any, ...] = _font_mono or (
         ("Consolas", 9) if os.name == "nt" else ("monospace", 9)
     )
@@ -292,6 +303,8 @@ def main() -> None:
     btn_files.pack(side=tk.LEFT)
     btn_compose = ttk.Button(fr_top_bar, text="选择 compose jsonl（仅修正）…")
     btn_compose.pack(side=tk.LEFT, padx=(8, 0))
+    btn_lecture = ttk.Button(fr_top_bar, text="选择结果 xlsx（讲师提醒）…")
+    btn_lecture.pack(side=tk.LEFT, padx=(8, 0))
     lbl_in = ttk.Label(fr_top, text="未选择", foreground="#666")
     lbl_in.pack(anchor=tk.W, pady=(4, 0))
     lbl_thumb_note = ttk.Label(
@@ -309,6 +322,7 @@ def main() -> None:
 
     def _clear_input_preview() -> None:
         compose_jsonl_in[0] = None
+        xlsx_lecture_in[0] = None
         lbl_thumb_note.config(
             text=(
                 "选择含图的文件夹或图片后，将开始处理（本界面不展示图片预览）。"
@@ -323,6 +337,7 @@ def main() -> None:
         if not p:
             return
         compose_jsonl_in[0] = None
+        xlsx_lecture_in[0] = None
         d = Path(p)
         img_paths = _list_images(d)
         work_dir[0] = d
@@ -347,6 +362,7 @@ def main() -> None:
         if not files:
             return
         compose_jsonl_in[0] = None
+        xlsx_lecture_in[0] = None
         paths = [Path(f) for f in files if Path(f).is_file()]
         if not paths:
             return
@@ -384,6 +400,7 @@ def main() -> None:
         _clear_input_preview()
         work_dir[0] = None
         is_temp[0] = False
+        xlsx_lecture_in[0] = None
         compose_jsonl_in[0] = cp
         lbl_in.config(text=f"compose jsonl: {cp}", foreground="black")
         lbl_thumb_note.config(
@@ -391,9 +408,31 @@ def main() -> None:
             foreground="#444",
         )
 
+    def on_pick_lecture_xlsx() -> None:
+        p = filedialog.askopenfilename(
+            title="选择已导出的结果表（xlsx）",
+            filetypes=[("Excel", "*.xlsx"), ("全部", "*.*")],
+        )
+        if not p:
+            return
+        xp = Path(p)
+        if not xp.is_file():
+            return
+        _clear_input_preview()
+        work_dir[0] = None
+        is_temp[0] = False
+        compose_jsonl_in[0] = None
+        xlsx_lecture_in[0] = xp
+        lbl_in.config(text=f"结果 xlsx: {xp}", foreground="black")
+        lbl_thumb_note.config(
+            text="将仅做「讲师提醒」列：流式 CSV 断点续跑，同目录另存为 *_lecture_tips.xlsx。",
+            foreground="#444",
+        )
+
     btn_dir["command"] = on_pick_dir
     btn_files["command"] = on_pick_files
     btn_compose["command"] = on_pick_compose_jsonl
+    btn_lecture["command"] = on_pick_lecture_xlsx
 
     # 输出说明
     fr_out = ttk.LabelFrame(content, text="输出位置", padding=6)
@@ -530,6 +569,7 @@ def main() -> None:
         btn_dir["state"] = state
         btn_files["state"] = state
         btn_compose["state"] = state
+        btn_lecture["state"] = state
 
     def _reset_to_initial(*, keep_last_out: bool = True) -> None:
         """一次任务结束后回到初始可运行状态（保留日志；可选择保留 last_out 以便打开目录）。"""
@@ -537,6 +577,7 @@ def main() -> None:
         work_dir[0] = None
         is_temp[0] = False
         compose_jsonl_in[0] = None
+        xlsx_lecture_in[0] = None
         _clear_input_preview()
         lbl_in.config(text="未选择", foreground="#666")
         # 进度与状态
@@ -567,9 +608,14 @@ def main() -> None:
     def on_run() -> None:
         if is_running[0]:
             return
+        xl = xlsx_lecture_in[0]
         wd = work_dir[0]
         cp = compose_jsonl_in[0]
-        if cp is None:
+        if xl is not None:
+            if not isinstance(xl, Path) or not xl.is_file():
+                messagebox.showwarning("提示", "请先通过「选择结果 xlsx（讲师提醒）」选择有效的表文件。")
+                return
+        elif cp is None:
             if not wd or not wd.is_dir():
                 messagebox.showwarning("提示", "请先通过「选文件夹」或「选多图」添加输入。")
                 return
@@ -579,11 +625,12 @@ def main() -> None:
                 return
         else:
             n = 0
-        was_temp = is_temp[0]
+        was_temp = is_temp[0] if xl is None else False
         run_cancel.clear()
         user_paused[0] = False
-        # compose 模式：输出写到 compose jsonl 同目录，便于断点续跑复用 refined_merged_stream.csv
-        if cp is not None:
+        if xl is not None:
+            out = xl.parent
+        elif cp is not None:
             out = cp.parent
         else:
             ts = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -595,16 +642,28 @@ def main() -> None:
         last_out[0] = out
         lbl_path.config(text=f"本次输出: {out.resolve()}", foreground="black")
 
-        # 导出文件名也带上“输入文件夹名”，避免同目录下分不清来源
-        if cp is not None:
+        if xl is not None:
+            export_tag = _safe_name(xl.stem or "result")
+            out_jsonl_path = out / f"lecture_tips_{export_tag}.jsonl"
+            out_csv_path = out / f"{export_tag}_lecture_tips_stream.csv"
+            out_xlsx_path = out / f"{export_tag}_lecture_tips.xlsx"
+        elif cp is not None:
             export_tag = _safe_name(cp.parent.name or "compose")
+            out_jsonl_path = out / f"refined_merged_{export_tag}.jsonl"
+            out_csv_path = out / f"refined_merged_stream_{export_tag}.csv"
+            out_xlsx_path = out / f"refined_merged_{export_tag}.xlsx"
         else:
-            export_tag = src_name
-        out_jsonl_path = out / f"refined_merged_{export_tag}.jsonl"
-        out_csv_path = out / f"refined_merged_stream_{export_tag}.csv"
-        out_xlsx_path = out / f"refined_merged_{export_tag}.xlsx"
+            src_name2 = "input"
+            if wd is not None and isinstance(wd, Path) and wd.name:
+                src_name2 = _safe_name(wd.name)
+            export_tag = src_name2
+            out_jsonl_path = out / f"refined_merged_{export_tag}.jsonl"
+            out_csv_path = out / f"refined_merged_stream_{export_tag}.csv"
+            out_xlsx_path = out / f"refined_merged_{export_tag}.xlsx"
 
-        if cp is not None:
+        if xl is not None:
+            st_lbl.config(text="结果 xlsx → 生成讲师提醒（流式 CSV）…")
+        elif cp is not None:
             st_lbl.config(text="compose jsonl → 教材向修正（流式 CSV + xlsx）…")
         else:
             if bool(stream_refine_var.get()):
@@ -677,6 +736,21 @@ def main() -> None:
 
         refined_n: list[int] = [0]
 
+        def on_lecture_tips_pr(n_done: int, n_total: int) -> None:
+            if n_total <= 0:
+                v = 1000
+            else:
+                v = int(1000 * min(max(n_done, 0), n_total) / max(1, n_total))
+
+            def u() -> None:
+                pb["value"] = min(1000, max(0, v))
+                if n_total > 0:
+                    st_lbl.config(
+                        text=f"讲师提醒 {n_done}/{n_total} · {100.0 * min(n_done, n_total) / max(1, n_total):.1f}%"
+                    )
+
+            root.after(0, u)
+
         def on_refine_item_done(n_done: int) -> None:
             refined_n[0] = int(n_done)
 
@@ -696,6 +770,29 @@ def main() -> None:
         def work() -> None:
             err: str | None = None
             vlm: dict[str, Any] = {}
+            if xl is not None:
+                lec: dict[str, Any] | None = None
+                try:
+                    lec = run_lecture_tips_from_xlsx(
+                        in_xlsx=xl,
+                        out_jsonl=out_jsonl_path,
+                        out_csv=out_csv_path,
+                        out_xlsx=out_xlsx_path,
+                        config_path=_write_runtime_config(out),
+                        model=None,
+                        on_progress=on_lecture_tips_pr,
+                    )
+                except Exception as e:  # noqa: BLE001
+                    err = str(e)
+                s_lect: dict[str, Any] = {
+                    "mode": "xlsx_lecture_tips",
+                    "out_dir": str(out),
+                    "lecture_tips": lec,
+                    "n_pages": 0,
+                }
+                e_done = err
+                root.after(0, lambda e=e_done, s=s_lect: on_done(e, s))
+                return
             try:
                 runtime_cfg = _write_runtime_config(out)
                 if cp is None:
@@ -841,6 +938,25 @@ def main() -> None:
                 messagebox.showerror("转写失败", e)
                 _reset_to_initial(keep_last_out=True)
                 return
+            if s.get("mode") == "xlsx_lecture_tips":
+                pb["value"] = 1000
+                od0 = s.get("out_dir") or str(out)
+                lp = Path(od0)
+                if lp.is_dir():
+                    last_out[0] = lp
+                st_lbl.config(text="完成", foreground="green")
+                btn_ref["state"] = tk.NORMAL
+                lt = s.get("lecture_tips")
+                if isinstance(lt, dict):
+                    _append_t(
+                        f"\n==== 讲师提醒 ====  待补行: {lt.get('n_pending_rows', '')}  本步写入: {lt.get('n_stream_rows', '')}\n"
+                        f"xlsx: {lt.get('out_xlsx', '')}\n"
+                        f"流式 CSV: {lt.get('out_csv', '')}\n"
+                    )
+                ox = (lt or {}).get("out_xlsx", "") if isinstance(lt, dict) else ""
+                messagebox.showinfo("完成", f"已生成讲师提醒另存为:\n{ox}\n同目录有流式 CSV 可断点续跑。")
+                _reset_to_initial(keep_last_out=True)
+                return
             lc = s.get("llm_compose")
             vlm_c = s.get("cancelled", False)
             llm_c = bool((lc or {}).get("cancelled", False) if isinstance(lc, dict) else False)
@@ -949,10 +1065,10 @@ def main() -> None:
     ).pack(side=tk.LEFT)
     btn_s["command"] = on_run
 
-    # --- 教材向修正参数（与是否联网脱钩）
+    # --- LLM 参数：教材向修正 + 结果表「讲师提醒」
     fr_refine_flags = ttk.Frame(fr_ops)
     fr_refine_flags.pack(fill=tk.X, pady=(6, 0))
-    ttk.Label(fr_refine_flags, text="修正参数：").pack(side=tk.LEFT)
+    ttk.Label(fr_refine_flags, text="LLM 参数：").pack(side=tk.LEFT)
 
     # 读取默认配置作为初始值（GUI 允许覆盖；未覆盖时仍是默认行为）
     _cfg0: dict[str, Any] = {}
@@ -961,18 +1077,32 @@ def main() -> None:
     except Exception:
         _cfg0 = {}
     _rcfg0 = dict((_cfg0.get("refine") or {}) if isinstance(_cfg0, dict) else {})
+    _lcfg0 = dict((_cfg0.get("lecture_tips") or {}) if isinstance(_cfg0, dict) else {})
     _stream0 = bool(_rcfg0.get("stream_refine", False))
-    _web0 = bool(_rcfg0.get("web_search", False))
+    # 联网：教材修正与讲师提醒共用一开关，初始为任一侧曾为 true 则为 true
+    _web0 = bool(_rcfg0.get("web_search", False)) or bool(_lcfg0.get("web_search", False))
+    _ltw0 = bool(_rcfg0.get("lecture_tips_with_refine", False))
     stream_refine_var = tk.BooleanVar(value=_stream0)
     web_search_var = tk.BooleanVar(value=_web0)
+    lecture_tips_with_refine_var = tk.BooleanVar(value=_ltw0)
 
     ttk.Checkbutton(fr_refine_flags, text="凑题缓存→流式修正", variable=stream_refine_var).pack(side=tk.LEFT, padx=(6, 0))
-    ttk.Checkbutton(fr_refine_flags, text="联网检索", variable=web_search_var).pack(side=tk.LEFT, padx=(12, 0))
+    ttk.Checkbutton(
+        fr_refine_flags,
+        text="联网检索",
+        variable=web_search_var,
+    ).pack(side=tk.LEFT, padx=(12, 0))
+    ttk.Checkbutton(
+        fr_refine_flags,
+        text="修正时同批写「讲师提醒」（单次 LLM，与教材修正同一 JSON）",
+        variable=lecture_tips_with_refine_var,
+    ).pack(side=tk.LEFT, padx=(12, 0))
 
     def _write_runtime_config(out_dir: Path) -> Path | None:
         """
-        将 GUI 上的 refine 开关落到一个运行时 YAML，并把路径传给 refine 流程。
-        仅覆盖 refine.web_search；其余沿用默认配置。
+        将 GUI 上 LLM 相关开关写入 `_runtime_config.yaml`：
+        - refine：stream_refine、web_search、lecture_tips_with_refine
+        - lecture_tips：与 refine 的 web_search 同步（供 xlsx 讲师提醒步骤使用）
         """
         try:
             cfg = load_config(None)
@@ -981,9 +1111,14 @@ def main() -> None:
         if not isinstance(cfg, dict):
             cfg = {}
         rcfg = dict(cfg.get("refine") or {})
+        lcfg = dict(cfg.get("lecture_tips") or {})
+        ws = bool(web_search_var.get())
         rcfg["stream_refine"] = bool(stream_refine_var.get())
-        rcfg["web_search"] = bool(web_search_var.get())
+        rcfg["web_search"] = ws
+        rcfg["lecture_tips_with_refine"] = bool(lecture_tips_with_refine_var.get())
+        lcfg["web_search"] = ws
         cfg["refine"] = rcfg
+        cfg["lecture_tips"] = lcfg
         p = (out_dir / "_runtime_config.yaml").resolve()
         p.write_text(yaml.safe_dump(cfg, allow_unicode=True, sort_keys=False), encoding="utf-8")
         return p

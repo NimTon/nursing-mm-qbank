@@ -13,6 +13,8 @@ __REFINE_EXAMPLE__
 __MERGED_JSON__
 ```
 
+__REFINE_LECTURE_BLOCK__
+
 只输出最外层一个 JSON 对象，键为 `items`。
 
 输出条数与顺序要求：
