@@ -6,22 +6,36 @@ from typing import Any, Sequence
 from openpyxl import Workbook
 from openpyxl.utils import get_column_letter
 
-# 表头与行 dict 键一致
-_BASE_REFINED_XLSX_COLUMNS: Sequence[str] = (
-    "题号",
-    "修正状态",
-    "原问题",
-    "原解析",
-    "修正后问题",
-    "修正问题原因",
-    "修正问题参考来源",
-    "修正后解析",
-    "修正解析原因",
-    "修正解析参考来源",
-    "讲师提醒",
-    "要点",
-    "讲课内容",
-)
+
+def refined_export_columns(
+    *,
+    include_lecture_tips: bool = True,
+    include_lecture_content: bool = True,
+) -> tuple[str, ...]:
+    """
+    精修结果表列顺序（与行 dict 键一致）。
+    - ``include_lecture_tips=False``：不导出「讲师提醒」列（未启用同批讲师提醒时）。
+    - ``include_lecture_content=False``：不导出「要点」「讲课内容」列（未启用讲课内容阶段时）。
+    """
+    core: tuple[str, ...] = (
+        "题号",
+        "题目类型",
+        "修正状态",
+        "原问题",
+        "原解析",
+        "修正后问题",
+        "修正问题原因",
+        "修正问题参考来源",
+        "修正后解析",
+        "修正解析原因",
+        "修正解析参考来源",
+    )
+    tail: list[str] = []
+    if include_lecture_tips:
+        tail.append("讲师提醒")
+    if include_lecture_content:
+        tail.extend(["要点", "讲课内容"])
+    return core + tuple(tail)
 
 
 def _as_修正状态_cell(v: Any) -> str:
@@ -36,7 +50,13 @@ def _as_修正状态_cell(v: Any) -> str:
     return "否"
 
 
-def write_refined_rows_to_xlsx(path: Path, rows: list[dict[str, Any]]) -> None:
+def write_refined_rows_to_xlsx(
+    path: Path,
+    rows: list[dict[str, Any]],
+    *,
+    include_lecture_tips: bool = True,
+    include_lecture_content: bool = True,
+) -> None:
     path = path.resolve()
     path.parent.mkdir(parents=True, exist_ok=True)
     wb = Workbook()
@@ -44,7 +64,10 @@ def write_refined_rows_to_xlsx(path: Path, rows: list[dict[str, Any]]) -> None:
     if ws is None:
         return
     ws.title = "refined"
-    columns = tuple(_BASE_REFINED_XLSX_COLUMNS)
+    columns = refined_export_columns(
+        include_lecture_tips=include_lecture_tips,
+        include_lecture_content=include_lecture_content,
+    )
     for c, h in enumerate(columns, start=1):
         ws.cell(row=1, column=c, value=h)
     for r, row in enumerate(rows, start=2):

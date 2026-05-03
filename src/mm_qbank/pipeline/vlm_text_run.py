@@ -72,7 +72,12 @@ def _normalize_segment(raw: dict[str, Any]) -> dict[str, Any]:
         c = c_raw.replace("\r\n", "\n").strip()
     else:
         c = str(c_raw).strip()
-    return {"题号": n, "类型": t, "内容": c}
+    qt_raw = raw.get("题目类型") or raw.get("题型") or raw.get("试题类型")
+    qt = str(qt_raw).strip() if qt_raw is not None else ""
+    out: dict[str, Any] = {"题号": n, "类型": t, "内容": c}
+    if qt:
+        out["题目类型"] = qt
+    return out
 
 
 def _parse_vlm_response(raw: str) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:

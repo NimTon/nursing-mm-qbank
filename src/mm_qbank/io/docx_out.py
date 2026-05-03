@@ -167,6 +167,13 @@ def write_lecture_handout_docx(path: Path, rows: list[dict[str, Any]]) -> None:
         for run in h.runs:
             _apply_handout_font_to_run(run, pt=Pt(14))
 
+        qt = str(row.get("题目类型") or "").strip()
+        if qt:
+            pq = doc.add_paragraph()
+            rq = pq.add_run(f"【题目类型】{qt}")
+            rq.bold = True
+            _apply_handout_font_to_run(rq, pt=Pt(11))
+
         def _section(heading: str, body: str, *, points_block: bool = False) -> None:
             p0 = doc.add_paragraph()
             r0 = p0.add_run(heading)

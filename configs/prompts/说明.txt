@@ -2,8 +2,13 @@
 
 文件说明：
 - vlm_system.txt / vlm_user.txt         — 多模态 VLM 整页转写
-- llm_compose_system.txt / llm_compose_user.txt  — 文本拆题；用户模板中整页原文占位符为 __PAGE_PLAIN__
-- refine_system.txt / refine_example.txt / refine_user.txt  — 修正与导出；refine_user 中含占位 __REFINE_EXAMPLE__、__WEB_STATUS__、__PAGE_ID__、__MERGED_JSON__
+- llm_compose_system.txt / llm_compose_user.txt  — 历史/备用文本拆题模板；用户模板中整页原文占位符为 __PAGE_PLAIN__
+- refine_system.txt / refine_example.txt / refine_user.txt  — 修正与导出；refine_user 中含占位 __REFINE_EXAMPLE__、__WEB_STATUS__、__PAGE_ID__、__MERGED_JSON__；同批「讲师提醒」时可含 __REFINE_LECTURE_BLOCK__（或由程序插入 refine_user_lecture_block 内容）
+- refine_system_lecture_addon.txt / refine_example_with_lecture.txt / refine_user_lecture_block.txt  — 修正阶段同批输出「讲师提醒」时的追加模板
+- lecture_tips_system.txt / lecture_tips_example.txt / lecture_tips_user.txt  — 独立「讲师提醒」；lecture_tips_user 占位 __LECTURE_TIPS_EXAMPLE__、__WEB_STATUS__、__BATCH_ID__、__ITEMS_JSON__
+- lecture_content_system.txt — 「讲课内容」系统说明
+- lecture_content_example_tihao.txt / lecture_content_user_tihao.txt — 按题号批量写讲课内容；用户模板占位 __LECTURE_CONTENT_EXAMPLE__、__WEB_STATUS__、__BATCH_ID__、__ITEMS_JSON__
+- lecture_content_example_row.txt / lecture_content_user_row.txt — 按 Excel 行号批量写讲课内容；占位同上
 
 若某文件被删除，程序会回退到程序内置的默认提示词，并在日志中说明。
 

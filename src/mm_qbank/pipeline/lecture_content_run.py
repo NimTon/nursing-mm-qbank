@@ -238,6 +238,7 @@ def run_lecture_content_on_refined_rows(
 
     lcfg = dict(cfg.get("lecture_content") or {})
     rcfg = dict(cfg.get("refine") or {})
+    include_lecture_tips = bool(rcfg.get("lecture_tips_with_refine", False))
     text_model = (model or "").strip() or str(
         (lcfg.get("model") or rcfg.get("model") or tl.get("text_model") or "gpt-4o-mini")
     )
@@ -328,7 +329,11 @@ def run_lecture_content_on_refined_rows(
             items: list[dict[str, str]] = []
             for row in chunk:
                 th, q, a = qa_from_export_row(row)
-                items.append({"题号": th, "问题": q, "解析": a})
+                qt = str(row.get("题目类型") or "").strip()
+                rec: dict[str, str] = {"题号": th, "问题": q, "解析": a}
+                if qt:
+                    rec["题目类型"] = qt
+                items.append(rec)
             c = OpenAICompatClient(
                 api_key=str(tl.get("api_key")),
                 base_url=tl.get("base_url") or None,
@@ -445,7 +450,12 @@ def run_lecture_content_on_refined_rows(
         "\n".join(json.dumps(x, ensure_ascii=False) for x in j_full) + ("\n" if j_full else ""),
         encoding="utf-8",
     )
-    write_refined_rows_to_xlsx(xout, rows)
+    write_refined_rows_to_xlsx(
+        xout,
+        rows,
+        include_lecture_tips=include_lecture_tips,
+        include_lecture_content=True,
+    )
     write_lecture_handout_docx(dout, rows)
     return {
         "n_pending": total,
@@ -551,7 +561,16 @@ def run_lecture_content_from_xlsx(
             items: list[dict[str, str | int]] = []
             for excel_row, d in chunk:
                 t, q, a = qa_from_export_row(d)
-                items.append({"行号": int(excel_row), "题号": t, "问题": q, "解析": a})
+                qt = str(d.get("题目类型") or "").strip()
+                rec2: dict[str, str | int] = {
+                    "行号": int(excel_row),
+                    "题号": t,
+                    "问题": q,
+                    "解析": a,
+                }
+                if qt:
+                    rec2["题目类型"] = qt
+                items.append(rec2)
             c = OpenAICompatClient(
                 api_key=str(tl.get("api_key")),
                 base_url=tl.get("base_url") or None,

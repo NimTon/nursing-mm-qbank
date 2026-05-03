@@ -19,31 +19,13 @@ from mm_qbank.llm.client import OpenAICompatClient
 from mm_qbank.llm.jsonutil import parse_json_object
 from mm_qbank.llm.retry import call_with_retries_timeout
 from mm_qbank.pipeline.llm_compose_run import _manifest_out_root
-from mm_qbank.pipeline.vlm_merge import merge_vlm_items_by_tihao
+from mm_qbank.pipeline.vlm_merge import merge_sort_key_for_row, merge_sort_key_tihao_and_kind, merge_vlm_items_by_tihao
 from mm_qbank.pipeline.vlm_text_run import run_vlm_text_only
 from mm_qbank.prompts_loader import refine_system, refine_user_payload
 
 _log = logging.getLogger(__name__)
 
 _TIHAO_NUM = re.compile(r"\d+")
-
-
-def _tihao_sort_key(x: dict[str, Any]) -> tuple[int, int, str]:
-    """
-    题号排序键（升序）：
-    - 优先提取第一个数字作为主排序
-    - 无数字的放到最后
-    - 同数字时按原字符串再排一次，保证稳定可读
-    """
-    s = str(x.get("题号", "") or "").strip()
-    m = _TIHAO_NUM.search(s)
-    if not m:
-        return (1, 10**12, s)
-    try:
-        n = int(m.group(0))
-    except ValueError:
-        return (1, 10**12, s)
-    return (0, n, s)
 
 
 def _tihao_base(s: str) -> str:
@@ -67,9 +49,10 @@ def _normalize_out_item_flexible(
     """
     tihao = str(raw.get("题号", "") or "").strip()
     base = _tihao_base(tihao)
-    m = merged_map.get(base, {"题号": base, "问题": "", "解析": ""})
+    m = merged_map.get(base, {"题号": base, "问题": "", "解析": "", "题目类型": ""})
     原问 = str(raw.get("原问题") or "").strip() or str(m.get("问题") or "").strip()
     原析 = str(raw.get("原解析") or "").strip() or str(m.get("解析") or "").strip()
+    题型 = str(raw.get("题目类型") or "").strip() or str(m.get("题目类型") or "").strip() or "未知"
 
     修q_raw = str(raw.get("修正后问题", "") or "").strip()
     修a_raw = str(raw.get("修正后解析", "") or "").strip()
@@ -82,6 +65,7 @@ def _normalize_out_item_flexible(
         tip = str(raw.get("讲师提醒", "") or "").strip()
     return {
         "题号": tihao or str(raw.get("题号", base) or base).strip() or base,
+        "题目类型": 题型,
         "原问题": 原问,
         "原解析": 原析,
         "修正后问题": 修q_raw if changed else "",
@@ -151,9 +135,10 @@ def _normalize_out_item(
 ) -> dict[str, Any]:
     """以合并表 `m` 为准定「原*」，对模型输出做归一化。
 
-    规则：当 `修正状态=false`（或输出与原文等价）时，除 `题号` / `原问题` / `原解析` 外其余字段必须清空。
+    规则：当 `修正状态=false`（或输出与原文等价）时，除 `题号` / `题目类型` / `原问题` / `原解析` 外其余字段必须清空。
     """
     题 = m.get("题号", "")
+    题型 = str(m.get("题目类型") or "").strip() or "未知"
     原问 = m.get("问题", "")
     原析 = m.get("解析", "")
     修q_raw = str(raw.get("修正后问题", "") or "").strip()
@@ -165,8 +150,11 @@ def _normalize_out_item(
     tip = ""
     if include_lecture_tips:
         tip = str(raw.get("讲师提醒", "") or "").strip()
+    qt_raw = str(raw.get("题目类型") or "").strip()
+    题型 = qt_raw or 题型
     out = {
         "题号": str(raw.get("题号", 题) or 题).strip() or 题,
+        "题目类型": 题型,
         "原问题": 原问,
         "原解析": 原析,
         "修正后问题": 修q_raw if changed else "",
@@ -249,6 +237,7 @@ def run_refine_vlm_merged(
     )
     web_search = bool(rcfg.get("web_search", False))
     include_lecture_tips = bool(rcfg.get("lecture_tips_with_refine", False))
+    export_csv_xlsx_lc = bool(rcfg.get("lecture_content_after_refine", False))
     temp = float(rcfg.get("temperature", 0.2))
     timeout = float(rcfg.get("timeout_seconds", 180.0))
 
@@ -316,12 +305,16 @@ def run_refine_vlm_merged(
                     "题号": n,
                     "问题_parts": [],
                     "解析_parts": [],
+                    "题目类型": "",
                     "page_ids": [],
                     "source_images": [],
                 }
                 a = agg[n]
             q = str(m.get("问题", "") or "").strip()
             r = str(m.get("解析", "") or "").strip()
+            qt = str(m.get("题目类型", "") or "").strip()
+            if qt and not str(a.get("题目类型") or "").strip():
+                a["题目类型"] = qt
             if q:
                 a["问题_parts"].append(q)
             if r:
@@ -332,13 +325,17 @@ def run_refine_vlm_merged(
                 a["source_images"].append(src)
 
     merged_all: list[dict[str, Any]] = []
-    for n in sorted(agg.keys(), key=lambda k: re.sub(r"\D", "", k) or k):
+    for n in sorted(
+        agg.keys(),
+        key=lambda k: merge_sort_key_tihao_and_kind(k, str(agg[k].get("题目类型") or "")),
+    ):
         if n in done_tihao:
             continue
         a = agg[n]
         merged_all.append(
             {
                 "题号": n,
+                "题目类型": str(a.get("题目类型") or "").strip() or "未知",
                 "问题": "\n\n".join(a["问题_parts"]).strip(),
                 "解析": "\n\n".join(a["解析_parts"]).strip(),
                 "page_ids": a["page_ids"],
@@ -354,7 +351,12 @@ def run_refine_vlm_merged(
         rsys = refine_system(include_lecture_tips=include_lecture_tips)
         total = len(merged_all)
         merged_map: dict[str, dict[str, str]] = {
-            str(x.get("题号") or "").strip(): {"题号": str(x.get("题号") or "").strip(), "问题": str(x.get("问题") or ""), "解析": str(x.get("解析") or "")}
+            str(x.get("题号") or "").strip(): {
+                "题号": str(x.get("题号") or "").strip(),
+                "题目类型": str(x.get("题目类型") or "").strip() or "未知",
+                "问题": str(x.get("问题") or ""),
+                "解析": str(x.get("解析") or ""),
+            }
             for x in merged_all
             if str(x.get("题号") or "").strip()
         }
@@ -393,7 +395,13 @@ def run_refine_vlm_merged(
         def _refine_one_batch(batch_idx: int, st: int, ed: int) -> tuple[int, list[dict[str, Any]]]:
             chunk = merged_all[st:ed]
             chunk_simple: list[dict[str, Any]] = [
-                {"题号": x["题号"], "问题": x["问题"], "解析": x["解析"]} for x in chunk
+                {
+                    "题号": x["题号"],
+                    "题目类型": x.get("题目类型", "") or "未知",
+                    "问题": x["问题"],
+                    "解析": x["解析"],
+                }
+                for x in chunk
             ]
             up = refine_user_payload(
                 page_id=f"跨页合并 {batch_idx}",
@@ -460,7 +468,7 @@ def run_refine_vlm_merged(
                 meta = agg.get(base)
                 if meta is None:
                     continue
-                m = merged_map.get(base, {"题号": base, "问题": "", "解析": ""})
+                m = merged_map.get(base, {"题号": base, "问题": "", "解析": "", "题目类型": ""})
                 row = _normalize_out_item_flexible(
                     {base: m}, oi, include_lecture_tips=include_lecture_tips
                 )
@@ -472,7 +480,12 @@ def run_refine_vlm_merged(
                 # 关键：LLM 每完成一题，就立刻追加写入 CSV，并记录日志（并发下加锁保证文件一致性）
                 try:
                     with csv_lock:
-                        append_refined_rows_to_csv(cout, [row])
+                        append_refined_rows_to_csv(
+                            cout,
+                            [row],
+                            include_lecture_tips=include_lecture_tips,
+                            include_lecture_content=export_csv_xlsx_lc,
+                        )
                     _log.info(
                         "refine-done tihao=%s changed=%s lecture=%s -> csv=%s",
                         row.get("题号", ""),
@@ -508,8 +521,8 @@ def run_refine_vlm_merged(
 
     if not flat:
         _log.warning("无输出记录")
-    # 最终导出统一按题号升序（CSV 仍保持流式追加顺序用于断点续跑）
-    flat.sort(key=_tihao_sort_key)
+    # 最终导出：题型优先，再按题号（CSV 仍保持流式追加顺序用于断点续跑）
+    flat.sort(key=merge_sort_key_for_row)
     jout.parent.mkdir(parents=True, exist_ok=True)
     jout.write_text(
         "\n".join(json.dumps(x, ensure_ascii=False) for x in flat) + ("\n" if flat else ""),
@@ -525,7 +538,12 @@ def run_refine_vlm_merged(
             on_progress=on_lecture_content_progress,
         )
     if lc_summary is None:
-        write_refined_rows_to_xlsx(xout, flat)
+        write_refined_rows_to_xlsx(
+            xout,
+            flat,
+            include_lecture_tips=include_lecture_tips,
+            include_lecture_content=export_csv_xlsx_lc,
+        )
     return {
         "n_rows": len(flat),
         "out_jsonl": str(jout),
@@ -571,6 +589,7 @@ def run_vlm_text_and_refine_streaming(
     )
     web_search = bool(rcfg.get("web_search", False))
     include_lecture_tips = bool(rcfg.get("lecture_tips_with_refine", False))
+    export_csv_xlsx_lc = bool(rcfg.get("lecture_content_after_refine", False))
     temp = float(rcfg.get("temperature", 0.2))
     timeout = float(rcfg.get("timeout_seconds", 180.0))
     batch_size = int(rcfg.get("batch_size", 20) or 20)
@@ -690,7 +709,15 @@ def run_vlm_text_and_refine_streaming(
                 batch_idx += 1
                 chunk = ready[:batch_size]
                 del ready[: min(batch_size, len(chunk))]
-                chunk_simple = [{"题号": x["题号"], "问题": x["问题"], "解析": x["解析"]} for x in chunk]
+                chunk_simple = [
+                    {
+                        "题号": x["题号"],
+                        "题目类型": x.get("题目类型", "") or "未知",
+                        "问题": x["问题"],
+                        "解析": x["解析"],
+                    }
+                    for x in chunk
+                ]
                 _log.info("stream-refine 请求 batch=%s 条=%s", batch_idx, len(chunk_simple))
                 refined = _refine_batch(batch_idx, chunk_simple)
                 for rrow, meta in zip(refined, chunk, strict=False):
@@ -700,7 +727,12 @@ def run_vlm_text_and_refine_streaming(
                     flat.append(rrow)
                     try:
                         with csv_lock:
-                            append_refined_rows_to_csv(cout, [rrow])
+                            append_refined_rows_to_csv(
+                                cout,
+                                [rrow],
+                                include_lecture_tips=include_lecture_tips,
+                                include_lecture_content=export_csv_xlsx_lc,
+                            )
                         _log.info(
                             "refine-done tihao=%s changed=%s -> csv=%s",
                             rrow.get("题号", ""),
@@ -746,10 +778,20 @@ def run_vlm_text_and_refine_streaming(
                     continue
                 a = buf.get(n)
                 if a is None:
-                    buf[n] = {"题号": n, "问题_parts": [], "解析_parts": [], "page_ids": [], "source_images": []}
+                    buf[n] = {
+                        "题号": n,
+                        "问题_parts": [],
+                        "解析_parts": [],
+                        "题目类型": "",
+                        "page_ids": [],
+                        "source_images": [],
+                    }
                     a = buf[n]
                 qtxt = str(m.get("问题", "") or "").strip()
                 atxt = str(m.get("解析", "") or "").strip()
+                qt = str(m.get("题目类型", "") or "").strip()
+                if qt and not str(a.get("题目类型") or "").strip():
+                    a["题目类型"] = qt
                 if qtxt:
                     a["问题_parts"].append(qtxt)
                 if atxt:
@@ -765,6 +807,7 @@ def run_vlm_text_and_refine_streaming(
                     ready.append(
                         {
                             "题号": n,
+                            "题目类型": str(a.get("题目类型") or "").strip() or "未知",
                             "问题": "\n\n".join(a["问题_parts"]).strip(),
                             "解析": "\n\n".join(a["解析_parts"]).strip(),
                             "page_ids": a["page_ids"],
@@ -797,8 +840,8 @@ def run_vlm_text_and_refine_streaming(
 
     if not flat:
         _log.warning("stream-refine 无输出记录")
-    # 最终导出统一按题号升序（CSV 仍保持流式追加顺序用于断点续跑）
-    flat.sort(key=_tihao_sort_key)
+    # 最终导出：题型优先，再按题号（CSV 仍保持流式追加顺序用于断点续跑）
+    flat.sort(key=merge_sort_key_for_row)
     jout.parent.mkdir(parents=True, exist_ok=True)
     jout.write_text(
         "\n".join(json.dumps(x, ensure_ascii=False) for x in flat) + ("\n" if flat else ""),
@@ -814,7 +857,12 @@ def run_vlm_text_and_refine_streaming(
             on_progress=on_lecture_content_progress,
         )
     if lc_summary is None:
-        write_refined_rows_to_xlsx(xout, flat)
+        write_refined_rows_to_xlsx(
+            xout,
+            flat,
+            include_lecture_tips=include_lecture_tips,
+            include_lecture_content=export_csv_xlsx_lc,
+        )
     return {
         **vlm_summary,
         "mode": "vlm+refine_stream",
@@ -869,6 +917,7 @@ def run_refine_from_compose_jsonl(
     )
     web_search = bool(rcfg.get("web_search", False))
     include_lecture_tips = bool(rcfg.get("lecture_tips_with_refine", False))
+    export_csv_xlsx_lc = bool(rcfg.get("lecture_content_after_refine", False))
     temp = float(rcfg.get("temperature", 0.2))
     timeout = float(rcfg.get("timeout_seconds", 180.0))
 
@@ -923,8 +972,18 @@ def run_refine_from_compose_jsonl(
                 continue
             a = agg.get(n)
             if a is None:
-                agg[n] = {"题号": n, "问题_parts": [], "解析_parts": [], "page_ids": [], "source_images": []}
+                agg[n] = {
+                    "题号": n,
+                    "问题_parts": [],
+                    "解析_parts": [],
+                    "题目类型": "",
+                    "page_ids": [],
+                    "source_images": [],
+                }
                 a = agg[n]
+            tk = str(it.get("type", "") or "").strip()
+            if tk and not str(a.get("题目类型") or "").strip():
+                a["题目类型"] = tk
             if q:
                 a["问题_parts"].append(q)
             if a_txt:
@@ -935,11 +994,15 @@ def run_refine_from_compose_jsonl(
                 a["source_images"].append(src)
 
     merged_all: list[dict[str, Any]] = []
-    for n in sorted(agg.keys(), key=lambda k: re.sub(r"\D", "", k) or k):
+    for n in sorted(
+        agg.keys(),
+        key=lambda k: merge_sort_key_tihao_and_kind(k, str(agg[k].get("题目类型") or "")),
+    ):
         a = agg[n]
         merged_all.append(
             {
                 "题号": n,
+                "题目类型": str(a.get("题目类型") or "").strip() or "未知",
                 "问题": "\n\n".join(a["问题_parts"]).strip(),
                 "解析": "\n\n".join(a["解析_parts"]).strip(),
                 "page_ids": a["page_ids"],
@@ -985,7 +1048,13 @@ def run_refine_from_compose_jsonl(
         def _refine_one_batch(batch_idx: int, st: int, ed: int) -> tuple[int, list[dict[str, Any]]]:
             chunk = merged_all[st:ed]
             chunk_simple: list[dict[str, Any]] = [
-                {"题号": x["题号"], "问题": x["问题"], "解析": x["解析"]} for x in chunk
+                {
+                    "题号": x["题号"],
+                    "题目类型": x.get("题目类型", "") or "未知",
+                    "问题": x["问题"],
+                    "解析": x["解析"],
+                }
+                for x in chunk
             ]
             up = refine_user_payload(
                 page_id=f"compose {batch_idx}",
@@ -1035,7 +1104,12 @@ def run_refine_from_compose_jsonl(
             out_items = _parse_refine_response(content)
             flat_part: list[dict[str, Any]] = []
             merged_map_batch: dict[str, dict[str, str]] = {
-                str(x.get("题号") or "").strip(): {"题号": str(x.get("题号") or "").strip(), "问题": str(x.get("问题") or ""), "解析": str(x.get("解析") or "")}
+                str(x.get("题号") or "").strip(): {
+                    "题号": str(x.get("题号") or "").strip(),
+                    "题目类型": str(x.get("题目类型") or "").strip() or "未知",
+                    "问题": str(x.get("问题") or ""),
+                    "解析": str(x.get("解析") or ""),
+                }
                 for x in chunk
                 if str(x.get("题号") or "").strip()
             }
@@ -1057,7 +1131,12 @@ def run_refine_from_compose_jsonl(
                 flat_part.append(row)
                 try:
                     with csv_lock:
-                        append_refined_rows_to_csv(cout, [row])
+                        append_refined_rows_to_csv(
+                            cout,
+                            [row],
+                            include_lecture_tips=include_lecture_tips,
+                            include_lecture_content=export_csv_xlsx_lc,
+                        )
                     _log.info(
                         "refine-done tihao=%s changed=%s lecture=%s -> csv=%s",
                         row.get("题号", ""),
@@ -1092,8 +1171,8 @@ def run_refine_from_compose_jsonl(
 
     if not flat:
         _log.warning("无输出记录")
-    # 最终导出统一按题号升序（CSV 仍保持流式追加顺序用于断点续跑）
-    flat.sort(key=_tihao_sort_key)
+    # 最终导出：题型优先，再按题号（CSV 仍保持流式追加顺序用于断点续跑）
+    flat.sort(key=merge_sort_key_for_row)
     jout.parent.mkdir(parents=True, exist_ok=True)
     jout.write_text(
         "\n".join(json.dumps(x, ensure_ascii=False) for x in flat) + ("\n" if flat else ""),
@@ -1109,7 +1188,12 @@ def run_refine_from_compose_jsonl(
             on_progress=on_lecture_content_progress,
         )
     if lc_summary is None:
-        write_refined_rows_to_xlsx(xout, flat)
+        write_refined_rows_to_xlsx(
+            xout,
+            flat,
+            include_lecture_tips=include_lecture_tips,
+            include_lecture_content=export_csv_xlsx_lc,
+        )
     return {
         "n_rows": len(flat),
         "out_jsonl": str(jout),

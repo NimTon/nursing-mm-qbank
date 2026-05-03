@@ -40,6 +40,8 @@ def main() -> None:
     temp = float(rcfg.get("temperature", 0.2))
     timeout_s = float(rcfg.get("timeout_seconds", 180.0))
     web_search = bool(rcfg.get("web_search", False))
+    include_lecture_tips = bool(rcfg.get("lecture_tips_with_refine", False))
+    export_csv_xlsx_lc = bool(rcfg.get("lecture_content_after_refine", False))
 
     question = str(args.question or "").strip()
     analysis = str(args.analysis or "").strip()
@@ -72,8 +74,18 @@ def main() -> None:
     xlsx_path = (out_dir / "refined.xlsx").resolve()
     json_path = (out_dir / "debug.json").resolve()
 
-    append_refined_rows_to_csv(csv_path, [row])
-    write_refined_rows_to_xlsx(xlsx_path, [row])
+    append_refined_rows_to_csv(
+        csv_path,
+        [row],
+        include_lecture_tips=include_lecture_tips,
+        include_lecture_content=export_csv_xlsx_lc,
+    )
+    write_refined_rows_to_xlsx(
+        xlsx_path,
+        [row],
+        include_lecture_tips=include_lecture_tips,
+        include_lecture_content=export_csv_xlsx_lc,
+    )
     json_path.write_text(
         json.dumps(
             {
