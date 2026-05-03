@@ -3,8 +3,9 @@
 - VLM 整页转写（带预处理：EXIF 纠正 + 自动 0/90/180/270 旋转 + deskew）
 - VLM 结果流式落盘（pages.jsonl 逐页写入）
 - 按题号缓冲：同题「问题+解析」凑齐就触发教材向修正（凑满一批就请求），并流式追加写 CSV 便于断点续跑
-- 结果 xlsx「讲师提醒」与教材向修正共用「联网检索」等 LLM 运行时开关（见界面「LLM 参数」）
-- 最终导出 xlsx/jsonl；也可直接选择 llm_compose_merged.jsonl 仅修正
+- 结果 xlsx「讲师提醒」与教材向修正共用「联网检索」等 LLM 运行时开关（见界面「LLM 参数」）；勾选后立即写入 ``configs/default.yaml``
+- 最终导出 xlsx/jsonl；可选「讲课内容」阶段另存 Word 讲义（Microsoft YaHei UI / 列表与 **加粗**）
+- 也可直接选择 llm_compose_merged.jsonl 仅修正
 
 运行：
   mm-qbank-gui
@@ -25,6 +26,7 @@ import tempfile
 import threading
 import time
 from datetime import datetime
+from copy import deepcopy
 from pathlib import Path
 from typing import Any
 import yaml
@@ -199,7 +201,9 @@ def main() -> None:
         logging.getLogger(name).setLevel(logging.INFO)
 
     root = tk.Tk()
-    root.title(f"nursing-mm-qbank v{__version__} · 结果 xlsx 批注「讲师提醒」（流式 CSV 续跑）")
+    root.title(
+        f"nursing-mm-qbank v{__version__} · VLM 转写 · 教材修正 · 讲师提醒 · 讲课内容（Word）"
+    )
     root.geometry("1200x800")
     root.minsize(720, 520)
     # 现代 ttk 主题（优先启用；缺依赖时自动降级）
@@ -276,6 +280,8 @@ def main() -> None:
     run_cancel = threading.Event()
     user_paused: list[bool] = [False]
     is_running: list[bool] = [False]
+    # ``work()`` 嵌套在 ``on_run`` 内，无法直接闭包到下方 ``_persist_llm_flags_from_gui``，用单元素列表转发
+    gui_llm_persist_cb: list[Any] = []
 
     # --- 顶部：输入（不显示缩略图/列表）
     fr_top = ttk.LabelFrame(content, text="图片输入", padding=8)
@@ -289,7 +295,7 @@ def main() -> None:
     ttk.Label(fr_ver, text=f"v{__version__}", foreground="#666", font=_font_small).pack(side=tk.LEFT, padx=(0, 6))
     ttk.Label(
         fr_ver,
-        text="结果表「讲师提醒」",
+        text="转写 · 修正 · 讲师提醒 · 讲课内容（Word）",
         foreground="#666",
         font=_font_small,
     ).pack(side=tk.LEFT)
@@ -720,6 +726,24 @@ def main() -> None:
 
             root.after(0, u)
 
+        def on_lecture_content_progress(n_done: int, n_total: int) -> None:
+            if n_total <= 0:
+                v = 1000
+            else:
+                v = 500 + int(500 * min(max(n_done, 0), n_total) / max(1, n_total))
+
+            def u() -> None:
+                pb["value"] = min(1000, max(0, v))
+                if n_total > 0:
+                    st_lbl.config(
+                        text=(
+                            f"讲课内容 {n_done}/{n_total} · "
+                            f"{50.0 + 50.0 * min(max(n_done, 0), n_total) / max(1, n_total):.1f}%"
+                        )
+                    )
+
+            root.after(0, u)
+
         def on_llm_page(j: int, t: int) -> None:
             if t <= 0:
                 return
@@ -773,12 +797,14 @@ def main() -> None:
             if xl is not None:
                 lec: dict[str, Any] | None = None
                 try:
+                    if gui_llm_persist_cb:
+                        gui_llm_persist_cb[0]()
                     lec = run_lecture_tips_from_xlsx(
                         in_xlsx=xl,
                         out_jsonl=out_jsonl_path,
                         out_csv=out_csv_path,
                         out_xlsx=out_xlsx_path,
-                        config_path=_write_runtime_config(out),
+                        config_path=None,
                         model=None,
                         on_progress=on_lecture_tips_pr,
                     )
@@ -794,7 +820,8 @@ def main() -> None:
                 root.after(0, lambda e=e_done, s=s_lect: on_done(e, s))
                 return
             try:
-                runtime_cfg = _write_runtime_config(out)
+                if gui_llm_persist_cb:
+                    gui_llm_persist_cb[0]()
                 if cp is None:
                     if bool(stream_refine_var.get()):
                         # 流式模式：VLM 每页完成就进入题号缓冲，凑齐同题问题+解析即入批，满批就请求修正并流式写 CSV
@@ -802,7 +829,7 @@ def main() -> None:
                         s = run_vlm_text_and_refine_streaming(
                             input_dir=wd,  # type: ignore[arg-type]
                             out_dir=out,
-                            config_path=runtime_cfg,
+                            config_path=None,
                             vlm_model=None,
                             refine_model=None,
                             out_jsonl=out_jsonl_path,
@@ -813,6 +840,7 @@ def main() -> None:
                             on_vlm_page_done=on_vlm_page,
                             on_refine_item_done=on_refine_item_done,
                             on_refine_progress=on_refine_progress,
+                            on_lecture_content_progress=on_lecture_content_progress,
                         )
                         # GUI 旧结构兼容：把 refine 摘要塞回 vlm dict
                         rf = {
@@ -849,9 +877,10 @@ def main() -> None:
                                 out_jsonl=out_jsonl_path,
                                 out_csv=out_csv_path,
                                 out_xlsx=out_xlsx_path,
-                                config_path=runtime_cfg,
+                                config_path=None,
                                 model=None,
                                 on_refine_progress=on_refine_progress,
+                                on_lecture_content_progress=on_lecture_content_progress,
                             )
                             # 与旧 streaming 返回结构兼容：把 refine 摘要塞回 vlm dict
                             vlm = {**vlm, "refine": rf}
@@ -871,9 +900,10 @@ def main() -> None:
                         out_jsonl=out_jsonl_path,
                         out_csv=out_csv_path,
                         out_xlsx=out_xlsx_path,
-                        config_path=_write_runtime_config(out),
+                        config_path=None,
                         model=None,
                         on_refine_progress=on_refine_progress,
+                        on_lecture_content_progress=on_lecture_content_progress,
                     )
                 except Exception as e3:  # noqa: BLE001
                     sm["refine"] = {"error": str(e3)}
@@ -1003,6 +1033,9 @@ def main() -> None:
                 _append_t(f"修正 + xlsx: {rf.get('out_xlsx')}\n")
                 if rf.get("out_csv"):
                     _append_t(f"修正（流式 CSV）: {rf.get('out_csv')}\n")
+                lcx = rf.get("lecture_content")
+                if isinstance(lcx, dict) and lcx.get("out_docx"):
+                    _append_t(f"讲课内容 Word: {lcx.get('out_docx')}\n")
             elif isinstance(rf, dict) and rf.get("error"):
                 _append_t(f"[修正/xlsx 未生成] {rf.get('error')}\n")
             ce = s.get("compose_error")
@@ -1015,6 +1048,9 @@ def main() -> None:
                 dmsg += "\n\n（本任务未跑拆题或无可拆页）"
             if isinstance(rf, dict) and rf.get("out_xlsx") and not rf.get("error"):
                 dmsg += f"\n\nxlsx: {rf['out_xlsx']}"
+                lcx2 = rf.get("lecture_content")
+                if isinstance(lcx2, dict) and lcx2.get("out_docx"):
+                    dmsg += f"\n\n讲义 Word: {lcx2['out_docx']}"
             elif isinstance(rf, dict) and rf.get("error"):
                 dmsg += f"\n\n修正/xlsx 失败: {rf.get('error', '')}"
             if ce:
@@ -1082,9 +1118,11 @@ def main() -> None:
     # 联网：教材修正与讲师提醒共用一开关，初始为任一侧曾为 true 则为 true
     _web0 = bool(_rcfg0.get("web_search", False)) or bool(_lcfg0.get("web_search", False))
     _ltw0 = bool(_rcfg0.get("lecture_tips_with_refine", False))
+    _lca0 = bool(_rcfg0.get("lecture_content_after_refine", False))
     stream_refine_var = tk.BooleanVar(value=_stream0)
     web_search_var = tk.BooleanVar(value=_web0)
     lecture_tips_with_refine_var = tk.BooleanVar(value=_ltw0)
+    lecture_content_after_refine_var = tk.BooleanVar(value=_lca0)
 
     ttk.Checkbutton(fr_refine_flags, text="凑题缓存→流式修正", variable=stream_refine_var).pack(side=tk.LEFT, padx=(6, 0))
     ttk.Checkbutton(
@@ -1097,31 +1135,60 @@ def main() -> None:
         text="修正时同批写「讲师提醒」（单次 LLM，与教材修正同一 JSON）",
         variable=lecture_tips_with_refine_var,
     ).pack(side=tk.LEFT, padx=(12, 0))
+    ttk.Checkbutton(
+        fr_refine_flags,
+        text="修正后生成「讲课内容」（要点+口播稿；另存 Word 讲义，默认 batch_size=1）",
+        variable=lecture_content_after_refine_var,
+    ).pack(side=tk.LEFT, padx=(12, 0))
 
-    def _write_runtime_config(out_dir: Path) -> Path | None:
+    _gui_default_yaml = (project_root() / "configs" / "default.yaml").resolve()
+
+    def _persist_llm_flags_from_gui() -> None:
         """
-        将 GUI 上 LLM 相关开关写入 `_runtime_config.yaml`：
-        - refine：stream_refine、web_search、lecture_tips_with_refine
-        - lecture_tips：与 refine 的 web_search 同步（供 xlsx 讲师提醒步骤使用）
+        将当前 GUI 上 LLM 相关开关立即写入 ``configs/default.yaml``（保留其余键），
+        替代往输出目录写 ``_runtime_config.yaml``；流水线使用 ``config_path=None`` 即读该文件。
         """
         try:
             cfg = load_config(None)
         except Exception:
-            cfg = {}
+            cfg = deepcopy(_cfg0) if isinstance(_cfg0, dict) else {}
         if not isinstance(cfg, dict):
             cfg = {}
         rcfg = dict(cfg.get("refine") or {})
         lcfg = dict(cfg.get("lecture_tips") or {})
+        lccfg = dict(cfg.get("lecture_content") or {})
         ws = bool(web_search_var.get())
         rcfg["stream_refine"] = bool(stream_refine_var.get())
         rcfg["web_search"] = ws
         rcfg["lecture_tips_with_refine"] = bool(lecture_tips_with_refine_var.get())
+        rcfg["lecture_content_after_refine"] = bool(lecture_content_after_refine_var.get())
         lcfg["web_search"] = ws
+        lccfg["web_search"] = ws
         cfg["refine"] = rcfg
         cfg["lecture_tips"] = lcfg
-        p = (out_dir / "_runtime_config.yaml").resolve()
-        p.write_text(yaml.safe_dump(cfg, allow_unicode=True, sort_keys=False), encoding="utf-8")
-        return p
+        cfg["lecture_content"] = lccfg
+        text = yaml.safe_dump(cfg, allow_unicode=True, sort_keys=False)
+        _gui_default_yaml.parent.mkdir(parents=True, exist_ok=True)
+        tmp = _gui_default_yaml.with_suffix(_gui_default_yaml.suffix + ".tmp")
+        tmp.write_text(text, encoding="utf-8")
+        tmp.replace(_gui_default_yaml)
+        logging.getLogger(__name__).info("已保存 GUI LLM 参数到 %s", _gui_default_yaml)
+
+    def _on_llm_flag_trace(*_: Any) -> None:
+        try:
+            _persist_llm_flags_from_gui()
+        except Exception as e:  # noqa: BLE001
+            logging.getLogger(__name__).warning("保存 configs/default.yaml 失败: %s", e)
+
+    for _bv in (
+        stream_refine_var,
+        web_search_var,
+        lecture_tips_with_refine_var,
+        lecture_content_after_refine_var,
+    ):
+        _bv.trace_add("write", _on_llm_flag_trace)
+
+    gui_llm_persist_cb.append(_persist_llm_flags_from_gui)
 
     root.mainloop()
     _LOG_QUEUE = None

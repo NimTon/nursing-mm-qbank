@@ -35,7 +35,7 @@ def llm_text_settings() -> dict[str, str | None]:
     """
     纯文本 LLM：``LLM_BASE_URL``、``LLM_API_KEY``、``LLM_MODEL``（未设模型时默认 ``gpt-4o-mini``）。
 
-    用于 llm-compose、vlm-refine、xlsx-lecture-tips。
+    用于 llm-compose、vlm-refine、xlsx-lecture-tips、xlsx-lecture-content。
     """
     b = (os.getenv("LLM_BASE_URL") or "").strip()
     k = (os.getenv("LLM_API_KEY") or "").strip()

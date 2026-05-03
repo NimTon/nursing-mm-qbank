@@ -101,3 +101,43 @@ def lecture_tips_user_payload(
         .replace("__BATCH_ID__", batch_id)
         .replace("__ITEMS_JSON__", json.dumps(items, ensure_ascii=False, indent=2))
     )
+
+
+def lecture_content_system() -> str:
+    return get_prompt("lecture_content_system.txt", _fb.LECTURE_CONTENT_SYSTEM)
+
+
+def lecture_content_user_payload_by_tihao(
+    *,
+    batch_id: str,
+    items: list[dict[str, str]],
+    web_search: bool,
+) -> str:
+    ex = get_prompt(
+        "lecture_content_example_tihao.txt", _fb.LECTURE_CONTENT_EXAMPLE_TIHAO
+    )
+    w = "已开启" if web_search else "已关闭"
+    body = get_prompt("lecture_content_user_tihao.txt", _fb.LECTURE_CONTENT_USER_TIHAO)
+    return (
+        body.replace("__LECTURE_CONTENT_EXAMPLE__", ex.strip())
+        .replace("__WEB_STATUS__", w)
+        .replace("__BATCH_ID__", batch_id)
+        .replace("__ITEMS_JSON__", json.dumps(items, ensure_ascii=False, indent=2))
+    )
+
+
+def lecture_content_user_payload_by_row(
+    *,
+    batch_id: str,
+    items: list[dict[str, str | int]],
+    web_search: bool,
+) -> str:
+    ex = get_prompt("lecture_content_example_row.txt", _fb.LECTURE_CONTENT_EXAMPLE_ROW)
+    w = "已开启" if web_search else "已关闭"
+    body = get_prompt("lecture_content_user_row.txt", _fb.LECTURE_CONTENT_USER_ROW)
+    return (
+        body.replace("__LECTURE_CONTENT_EXAMPLE__", ex.strip())
+        .replace("__WEB_STATUS__", w)
+        .replace("__BATCH_ID__", batch_id)
+        .replace("__ITEMS_JSON__", json.dumps(items, ensure_ascii=False, indent=2))
+    )

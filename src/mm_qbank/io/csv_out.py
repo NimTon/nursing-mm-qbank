@@ -22,6 +22,8 @@ _BASE_REFINED_CSV_COLUMNS: Sequence[str] = (
     "修正解析原因",
     "修正解析参考来源",
     "讲师提醒",
+    "要点",
+    "讲课内容",
     "page_id",
     "source_image",
 )
@@ -51,9 +53,11 @@ def append_refined_rows_to_csv(path: Path, rows: Iterable[dict[str, Any]]) -> in
         try:
             with path.open("r", encoding="utf-8-sig", newline="") as rf:
                 hdr = next(csv.reader(rf), None)
-            if hdr is not None and "讲师提醒" not in hdr:
+            if hdr is not None and (
+                "讲师提醒" not in hdr or "要点" not in hdr or "讲课内容" not in hdr
+            ):
                 _log.warning(
-                    "已有流式 CSV 表头不含「讲师提醒」，与当前程序列不一致，追加后 Excel 可能错位；建议删除后重跑：%s",
+                    "已有流式 CSV 表头与当前程序列不一致（须含 讲师提醒/要点/讲课内容），追加后可能错位；建议删除后重跑：%s",
                     path,
                 )
         except OSError:

@@ -12,6 +12,7 @@ from typing import Any, cast
 import csv
 
 from mm_qbank.config import load_config, llm_text_settings
+from mm_qbank.io.result_row_qa import qa_from_export_row
 from mm_qbank.io.xlsx_lecture import (
     append_lecture_tips_rows_to_csv,
     load_done_行号_from_lecture_csv,
@@ -27,17 +28,7 @@ _log = logging.getLogger(__name__)
 
 
 def _cell_qa(row: dict[str, str]) -> tuple[str, str, str]:
-    th = (row.get("题号") or "").strip()
-    修q = (row.get("修正后问题") or "").strip()
-    原q = (row.get("原问题") or "").strip()
-    问 = 修q or 原q or (row.get("问题") or "").strip()
-    修a = (row.get("修正后解析") or "").strip()
-    原a = (row.get("原解析") or "").strip()
-    析 = 修a or 原a or (row.get("解析") or "").strip()
-    t = th
-    if not t and (问 or 析):
-        t = "（空题号）"
-    return (t, 问, 析)
+    return qa_from_export_row(row)
 
 
 def _build_llm_items(

@@ -36,6 +36,7 @@ def test_mm_qbank_cli_help_exits_zero() -> None:
     assert "llm-compose" in out
     assert "vlm-refine" in out
     assert "xlsx-lecture-tips" in out
+    assert "xlsx-lecture-content" in out
 
 
 def test_vlm_refine_subparser_help() -> None:

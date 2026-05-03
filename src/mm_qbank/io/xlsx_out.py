@@ -19,6 +19,8 @@ _BASE_REFINED_XLSX_COLUMNS: Sequence[str] = (
     "修正解析原因",
     "修正解析参考来源",
     "讲师提醒",
+    "要点",
+    "讲课内容",
 )
 
 

@@ -6,6 +6,7 @@ import logging
 from pathlib import Path
 
 from mm_qbank.logging_utils import configure_logging
+from mm_qbank.pipeline.lecture_content_run import run_lecture_content_from_xlsx
 from mm_qbank.pipeline.lecture_tips_run import run_lecture_tips_from_xlsx
 from mm_qbank.pipeline.llm_compose_run import run_llm_compose_manifest
 from mm_qbank.pipeline.refine_vlm_run import run_refine_from_compose_jsonl, run_refine_vlm_merged
@@ -20,7 +21,7 @@ def main() -> None:
     parent.add_argument("-q", "--quiet", action="store_true", help="仅警告与错误 (WARNING)")
     parser = argparse.ArgumentParser(
         prog="mm-qbank",
-        description="护理题库：导入结果 xlsx 批注「讲师提醒」（xlsx-lecture-tips；流式 CSV 续跑、另存新表）",
+        description="护理题库：VLM 转写 / 教材修正 / xlsx 讲师提醒与讲课内容（Word）；流式 CSV 断点续跑（mm-qbank / mm-qbank-gui）",
         parents=[parent],
     )
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -153,6 +154,50 @@ def main() -> None:
         "--model", dest="lecture_model", type=str, default=None, help="覆盖 lecture_tips.model 或 LLM_MODEL"
     )
 
+    lcnt = sub.add_parser(
+        "xlsx-lecture-content",
+        parents=[parent],
+        help="从结果 xlsx 批量生成「要点」「讲课内容」，流式 CSV 断点续跑，另存 xlsx + Word 讲义",
+    )
+    lcnt.add_argument(
+        "--in-xlsx",
+        dest="lc_in_xlsx",
+        type=Path,
+        required=True,
+        help="已导出的结果表（与 refined 表结构兼容）",
+    )
+    lcnt.add_argument(
+        "--out-xlsx",
+        dest="lc_out_xlsx",
+        type=Path,
+        default=None,
+        help="输出 xlsx（默认同目录：原名_lecture_content.xlsx）",
+    )
+    lcnt.add_argument(
+        "--out-csv",
+        dest="lc_csv",
+        type=Path,
+        default=None,
+        help="流式追加 CSV（默认同目录：原名_lecture_content_stream.csv）",
+    )
+    lcnt.add_argument(
+        "--out-jsonl",
+        dest="lc_jsonl",
+        type=Path,
+        default=None,
+        help="汇总 jsonl（默认同目录）",
+    )
+    lcnt.add_argument(
+        "--config", dest="lc_config", type=Path, default=None, help="覆盖 configs/default.yaml"
+    )
+    lcnt.add_argument(
+        "--model",
+        dest="lc_model",
+        type=str,
+        default=None,
+        help="覆盖 lecture_content.model 或 LLM_MODEL",
+    )
+
     verify = sub.add_parser(
         "verify-config",
         parents=[parent],
@@ -214,6 +259,16 @@ def main() -> None:
             out_jsonl=args.lecture_jsonl,
             config_path=args.lecture_config,
             model=args.lecture_model,
+        )
+        print(json.dumps(summary, ensure_ascii=False, indent=2))
+    elif args.cmd == "xlsx-lecture-content":
+        summary = run_lecture_content_from_xlsx(
+            in_xlsx=args.lc_in_xlsx,
+            out_xlsx=args.lc_out_xlsx,
+            out_csv=args.lc_csv,
+            out_jsonl=args.lc_jsonl,
+            config_path=args.lc_config,
+            model=args.lc_model,
         )
         print(json.dumps(summary, ensure_ascii=False, indent=2))
     elif args.cmd == "verify-config":

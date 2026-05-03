@@ -197,6 +197,33 @@ def _parse_refine_response(raw: str) -> list[dict[str, Any]]:
     return [cast(dict[str, Any], x) for x in it if isinstance(x, dict)]
 
 
+def _maybe_run_lecture_content_stage(
+    flat: list[dict[str, Any]],
+    *,
+    out_xlsx: Path,
+    config_path: Path | None,
+    model: str | None,
+    on_progress: Any | None,
+) -> dict[str, Any] | None:
+    try:
+        cfg = load_config(config_path)
+    except Exception:  # noqa: BLE001
+        return None
+    rcfg = dict(cfg.get("refine") or {})
+    if not bool(rcfg.get("lecture_content_after_refine", False)):
+        return None
+    from mm_qbank.pipeline.lecture_content_run import run_lecture_content_on_refined_rows
+
+    _log.info("已启用 lecture_content_after_refine：将对修正结果追加「要点」「讲课内容」并导出讲义 Word")
+    return run_lecture_content_on_refined_rows(
+        flat,
+        out_xlsx=out_xlsx,
+        config_path=config_path,
+        model=model,
+        on_progress=on_progress,
+    )
+
+
 def run_refine_vlm_merged(
     *,
     manifest_path: Path,
@@ -206,6 +233,7 @@ def run_refine_vlm_merged(
     config_path: Path | None = None,
     model: str | None = None,
     on_refine_progress: Any | None = None,
+    on_lecture_content_progress: Any | None = None,
 ) -> dict[str, Any]:
     """
     读 ``vlm-text`` 的 ``pages.jsonl``，对每页 ``structured_file`` 按题号合并问题/解析，再经文本模型
@@ -487,7 +515,17 @@ def run_refine_vlm_merged(
         "\n".join(json.dumps(x, ensure_ascii=False) for x in flat) + ("\n" if flat else ""),
         encoding="utf-8",
     )
-    write_refined_rows_to_xlsx(xout, flat)
+    lc_summary = None
+    if flat:
+        lc_summary = _maybe_run_lecture_content_stage(
+            flat,
+            out_xlsx=xout,
+            config_path=config_path,
+            model=model,
+            on_progress=on_lecture_content_progress,
+        )
+    if lc_summary is None:
+        write_refined_rows_to_xlsx(xout, flat)
     return {
         "n_rows": len(flat),
         "out_jsonl": str(jout),
@@ -496,6 +534,7 @@ def run_refine_vlm_merged(
         "model": text_model,
         "web_search": web_search,
         "lecture_tips_with_refine": include_lecture_tips,
+        "lecture_content": lc_summary,
     }
 
 
@@ -514,6 +553,7 @@ def run_vlm_text_and_refine_streaming(
     on_vlm_page_done: Any | None = None,
     on_refine_item_done: Any | None = None,
     on_refine_progress: Any | None = None,
+    on_lecture_content_progress: Any | None = None,
 ) -> dict[str, Any]:
     """
     流水线：VLM 每页完成就合并题号缓冲；当同题「问题+解析」凑齐后立刻进入 LLM 缓冲批；
@@ -764,7 +804,17 @@ def run_vlm_text_and_refine_streaming(
         "\n".join(json.dumps(x, ensure_ascii=False) for x in flat) + ("\n" if flat else ""),
         encoding="utf-8",
     )
-    write_refined_rows_to_xlsx(xout, flat)
+    lc_summary = None
+    if flat:
+        lc_summary = _maybe_run_lecture_content_stage(
+            flat,
+            out_xlsx=xout,
+            config_path=config_path,
+            model=refine_model,
+            on_progress=on_lecture_content_progress,
+        )
+    if lc_summary is None:
+        write_refined_rows_to_xlsx(xout, flat)
     return {
         **vlm_summary,
         "mode": "vlm+refine_stream",
@@ -775,6 +825,7 @@ def run_vlm_text_and_refine_streaming(
         "refine_model": text_model,
         "web_search": web_search,
         "lecture_tips_with_refine": include_lecture_tips,
+        "lecture_content": lc_summary,
     }
 
 
@@ -802,6 +853,7 @@ def run_refine_from_compose_jsonl(
     config_path: Path | None = None,
     model: str | None = None,
     on_refine_progress: Any | None = None,
+    on_lecture_content_progress: Any | None = None,
 ) -> dict[str, Any]:
     """
     直接读取 llm-compose 的输出（每行一页，含 items=composed_items），将每题 stem/options/analysis
@@ -1047,7 +1099,17 @@ def run_refine_from_compose_jsonl(
         "\n".join(json.dumps(x, ensure_ascii=False) for x in flat) + ("\n" if flat else ""),
         encoding="utf-8",
     )
-    write_refined_rows_to_xlsx(xout, flat)
+    lc_summary = None
+    if flat:
+        lc_summary = _maybe_run_lecture_content_stage(
+            flat,
+            out_xlsx=xout,
+            config_path=config_path,
+            model=model,
+            on_progress=on_lecture_content_progress,
+        )
+    if lc_summary is None:
+        write_refined_rows_to_xlsx(xout, flat)
     return {
         "n_rows": len(flat),
         "out_jsonl": str(jout),
@@ -1056,5 +1118,6 @@ def run_refine_from_compose_jsonl(
         "model": text_model,
         "web_search": web_search,
         "lecture_tips_with_refine": include_lecture_tips,
+        "lecture_content": lc_summary,
         "compose_jsonl": str(cpath),
     }
