@@ -6,6 +6,10 @@ from typing import Any
 
 _LEADING_NUM = re.compile(r"^\s*(\d{1,4})\s*[\.、\)\]】]?\s*")
 
+# 聚合/断点续跑用：题号 + 题型（避免「单选第10题」与「多选第10题」共用题号键而误合并）
+_AGG_BUCKET_SEP = "\x1f"
+
+
 # 导出/展示顺序：题型序号越小越靠前（同类再按题号）
 _KIND_ORDER: dict[str, int] = {
     "单选": 10,
@@ -48,6 +52,32 @@ def question_kind_rank(label: str) -> int:
     return _KIND_ORDER.get(n, 8999)
 
 
+def aggregate_bucket_key(tihao: str, kind: str) -> str:
+    """
+    跨页/缓冲聚合用的稳定键：同一卷面题号在不同大题（单选/多选）下会重复，必须与题型一起区分。
+    ``题号`` 仍对用户展示为数字；本键仅用于内部 dict 与 CSV 断点匹配。
+    """
+    th = (tihao or "").strip()
+    k = (kind or "").strip()
+    kn = _normalize_question_kind_label(k) if k else "未知"
+    return f"{th}{_AGG_BUCKET_SEP}{kn}"
+
+
+def parse_aggregate_bucket_key(key: str) -> tuple[str, str]:
+    """``aggregate_bucket_key`` 的逆操作；无分隔符时视为旧版「仅题号」键。"""
+    if _AGG_BUCKET_SEP in key:
+        a, b = key.split(_AGG_BUCKET_SEP, 1)
+        return a, b
+    return (key or "").strip(), ""
+
+
+def merge_sort_key_for_aggregate_bucket(bucket_key: str) -> tuple:
+    """``agg`` / ``buf`` 等以 ``aggregate_bucket_key`` 为键时的排序键。"""
+    th, kn = parse_aggregate_bucket_key(bucket_key)
+    kr = _normalize_question_kind_label(kn) if kn else "未知"
+    return (question_kind_rank(kr), _题号排序键(th))
+
+
 def _题号排序键(s: str) -> tuple:
     t = s.strip()
     m = re.fullmatch(r"(\d+)", t)
@@ -73,57 +103,66 @@ def merge_sort_key_tihao_and_kind(tihao: str, kind: str) -> tuple:
 
 def merge_vlm_items_by_tihao(items: list[dict[str, Any]]) -> list[dict[str, str]]:
     """
-    将 VLM ``items``（`题号` + `类型`(问题/解析) + `内容`；可选 `题目类型`）按题号分组合并
+    将 VLM ``items``（`题号` + `类型`(问题/解析) + `内容`；可选 `题目类型`）按 **题号+题目类型** 分组合并
     成若干条，每条为 ``{题号, 题目类型, 问题, 解析}``（多段会换行连接）。
+
+    同一题号下「单选 / 多选」等不得合并到同一条，避免误触发后续按 ``10-1`` 形式拆分。
     """
     od: "OrderedDict[str, dict[str, Any]]" = OrderedDict()
     last_n: str | None = None
+    last_bucket_for_n: dict[str, str] = {}
     for it in items:
         if not isinstance(it, dict):
             continue
         n = str(it.get("题号", "") or "").strip()
-        key = n
-        if key not in od:
-            od[key] = {"题号": n, "问题": [], "解析": [], "题目类型": ""}
         typ = str(it.get("类型", "")).strip()
         qt_raw = str(it.get("题目类型") or it.get("题型") or it.get("试题类型") or "").strip()
-        if qt_raw and not str(od[key].get("题目类型") or "").strip():
-            od[key]["题目类型"] = qt_raw
         c = it.get("内容", "")
         if not isinstance(c, str):
             c = str(c) if c is not None else ""
         c = c.replace("\r\n", "\n").strip()
+        if c:
+            # 兜底：当「题号」为空时，尝试从内容开头提取；再不行则把解析/问题归到上一题（按阅读顺序）。
+            if not n:
+                m = _LEADING_NUM.match(c)
+                if m:
+                    n = m.group(1)
+                elif last_n:
+                    n = last_n
+            if n:
+                last_n = n
+        # 无内容片段仍可能需占位（与旧逻辑一致：无内容则跳过整条）
         if not c:
             continue
-        # 兜底：当「题号」为空时，尝试从内容开头提取；再不行则把解析/问题归到上一题（按阅读顺序）。
-        if not n:
-            m = _LEADING_NUM.match(c)
-            if m:
-                n = m.group(1)
-            elif last_n:
-                n = last_n
+        if not n and last_n:
+            n = last_n
         if n:
             last_n = n
-        key = n
-        if key not in od:
-            od[key] = {"题号": n, "问题": [], "解析": [], "题目类型": ""}
-        if qt_raw and not str(od[key].get("题目类型") or "").strip():
-            od[key]["题目类型"] = qt_raw
-        if typ == "问题":
-            od[key]["问题"].append(c)
-        elif typ == "解析":
-            od[key]["解析"].append(c)
+        if qt_raw.strip():
+            bucket_key = aggregate_bucket_key(n, qt_raw)
+            if n:
+                last_bucket_for_n[n] = bucket_key
+        elif n and n in last_bucket_for_n:
+            bucket_key = last_bucket_for_n[n]
+        elif n:
+            bucket_key = aggregate_bucket_key(n, "未知")
+            last_bucket_for_n[n] = bucket_key
         else:
-            od[key]["问题"].append(c)
+            bucket_key = aggregate_bucket_key("", "未知")
+
+        if bucket_key not in od:
+            od[bucket_key] = {"题号": n, "问题": [], "解析": [], "题目类型": ""}
+        if qt_raw and not str(od[bucket_key].get("题目类型") or "").strip():
+            od[bucket_key]["题目类型"] = qt_raw
+        if typ == "问题":
+            od[bucket_key]["问题"].append(c)
+        elif typ == "解析":
+            od[bucket_key]["解析"].append(c)
+        else:
+            od[bucket_key]["问题"].append(c)
     out: list[dict[str, str]] = []
-    for key in sorted(
-        od.keys(),
-        key=lambda k: (
-            question_kind_rank(str(od[k].get("题目类型") or "")),
-            _题号排序键(k) if k else (3, 0, ""),
-        ),
-    ):
-        v = od[key]
+    for bucket_key in sorted(od.keys(), key=merge_sort_key_for_aggregate_bucket):
+        v = od[bucket_key]
         题号 = str(v.get("题号", "") or "")
         问题 = "\n\n".join(x for x in v["问题"] if x).strip()
         解析 = "\n\n".join(x for x in v["解析"] if x).strip()

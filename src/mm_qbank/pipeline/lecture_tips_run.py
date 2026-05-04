@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import logging
-import math
 import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -119,9 +118,6 @@ def run_lecture_tips_from_xlsx(
     timeout = float(
         lcfg.get("timeout_seconds", rcfg.get("timeout_seconds", 180.0) or 180.0) or 180.0
     )
-    batch_size = int(lcfg.get("batch_size", rcfg.get("batch_size", 10)) or 10)
-    if batch_size < 1:
-        batch_size = 10
 
     default_headers: dict[str, str] | None = None
     burl = (tl.get("base_url") or "") or ""
@@ -176,11 +172,7 @@ def run_lecture_tips_from_xlsx(
 
     if total > 0:
         raw_max_workers = lcfg.get("max_workers", rcfg.get("max_workers"))
-        if total <= batch_size:
-            target_tasks = _cap_workers(total, raw_max_workers)
-            chunk_size = int(math.ceil(total / target_tasks)) if target_tasks > 0 else total
-        else:
-            chunk_size = batch_size
+        chunk_size = 1
         batches: list[tuple[int, int, int]] = []
         for batch_idx, st in enumerate(range(0, total, chunk_size), start=1):
             ed = min(total, st + chunk_size)
@@ -188,11 +180,9 @@ def run_lecture_tips_from_xlsx(
         n_batches = len(batches)
         max_rw = _cap_workers(n_batches, raw_max_workers)
         _log.info(
-            "lecture-tips 待处理行=%s 批次数=%s chunk_size=%s batch_size=%s max_workers=%s",
+            "lecture-tips 待处理行=%s 批次数=%s（每批 1 行）max_workers=%s",
             total,
             n_batches,
-            chunk_size,
-            batch_size,
             max_rw,
         )
         csv_lock = Lock()

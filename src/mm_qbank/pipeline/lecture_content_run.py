@@ -3,7 +3,6 @@ from __future__ import annotations
 import csv
 import json
 import logging
-import math
 import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -247,9 +246,6 @@ def run_lecture_content_on_refined_rows(
     timeout = float(
         lcfg.get("timeout_seconds", rcfg.get("timeout_seconds", 300.0) or 300.0) or 300.0
     )
-    batch_size = int(lcfg.get("batch_size", 1) or 1)
-    if batch_size < 1:
-        batch_size = 1
 
     default_headers: dict[str, str] | None = None
     burl = (tl.get("base_url") or "") or ""
@@ -300,11 +296,7 @@ def run_lecture_content_on_refined_rows(
 
     if total > 0:
         raw_max_workers = lcfg.get("max_workers", rcfg.get("max_workers"))
-        if total <= batch_size:
-            target_tasks = _cap_workers(total, raw_max_workers)
-            chunk_size = int(math.ceil(total / target_tasks)) if target_tasks > 0 else total
-        else:
-            chunk_size = batch_size
+        chunk_size = 1
         batches: list[tuple[int, int, int]] = []
         for batch_idx, st in enumerate(range(0, total, chunk_size), start=1):
             ed = min(total, st + chunk_size)
@@ -312,11 +304,9 @@ def run_lecture_content_on_refined_rows(
         n_batches = len(batches)
         max_rw = _cap_workers(n_batches, raw_max_workers)
         _log.info(
-            "lecture-content(refined) 待处理题=%s 批次数=%s chunk=%s batch_size=%s max_workers=%s",
+            "lecture-content(refined) 待处理题=%s 批次数=%s（每批 1 题）max_workers=%s",
             total,
             n_batches,
-            chunk_size,
-            batch_size,
             max_rw,
         )
         csv_lock = Lock()
@@ -382,24 +372,42 @@ def run_lecture_content_on_refined_rows(
                     e,
                 ),
             )
-            parsed = _parse_items_json(content)
-            by_out: dict[str, tuple[str, str]] = {}
-            for it in parsed:
-                tk = str(it.get("题号", "") or "").strip()
-                if not tk:
-                    continue
-                by_out[tk] = (
-                    str(it.get("要点", "") or "").strip(),
-                    str(it.get("讲课内容", "") or "").strip(),
+            try:
+                parsed = _parse_items_json(content)
+            except json.JSONDecodeError as e:
+                _log.warning(
+                    "lecture-content batch=%s/%s JSON 解析失败，整段回复写入「讲课内容」（要点留空）: %s",
+                    bix,
+                    n_batches,
+                    e,
                 )
-            if len(chunk) == len(items) and len(parsed) < len(items):
-                _log.warning("batch %s: 返回条数=%s 少于输入=%s", bix, len(parsed), len(items))
+                parsed = None
 
-            flat_csv: list[dict[str, Any]] = []
-            for row in chunk:
-                th, _, _ = qa_from_export_row(row)
-                pt, lc = by_out.get(th, ("", ""))
-                flat_csv.append({"题号": th, "要点": pt, "讲课内容": lc})
+            flat_csv: list[dict[str, Any]]
+            if parsed is None:
+                raw_lc = content.strip()
+                flat_csv = []
+                for row in chunk:
+                    th, _, _ = qa_from_export_row(row)
+                    flat_csv.append({"题号": th, "要点": "", "讲课内容": raw_lc})
+            else:
+                by_out: dict[str, tuple[str, str]] = {}
+                for it in parsed:
+                    tk = str(it.get("题号", "") or "").strip()
+                    if not tk:
+                        continue
+                    by_out[tk] = (
+                        str(it.get("要点", "") or "").strip(),
+                        str(it.get("讲课内容", "") or "").strip(),
+                    )
+                if len(chunk) == len(items) and len(parsed) < len(items):
+                    _log.warning("batch %s: 返回条数=%s 少于输入=%s", bix, len(parsed), len(items))
+
+                flat_csv = []
+                for row in chunk:
+                    th, _, _ = qa_from_export_row(row)
+                    pt, lc = by_out.get(th, ("", ""))
+                    flat_csv.append({"题号": th, "要点": pt, "讲课内容": lc})
             try:
                 with csv_lock:
                     append_lecture_content_tihao_csv(cout, flat_csv)
@@ -497,9 +505,6 @@ def run_lecture_content_from_xlsx(
     timeout = float(
         lcfg.get("timeout_seconds", rcfg.get("timeout_seconds", 300.0) or 300.0) or 300.0
     )
-    batch_size = int(lcfg.get("batch_size", 1) or 1)
-    if batch_size < 1:
-        batch_size = 1
 
     default_headers: dict[str, str] | None = None
     burl = (tl.get("base_url") or "") or ""
@@ -540,11 +545,7 @@ def run_lecture_content_from_xlsx(
 
     if total > 0:
         raw_max_workers = lcfg.get("max_workers", rcfg.get("max_workers"))
-        if total <= batch_size:
-            target_tasks = _cap_workers(total, raw_max_workers)
-            chunk_size = int(math.ceil(total / target_tasks)) if target_tasks > 0 else total
-        else:
-            chunk_size = batch_size
+        chunk_size = 1
         batches: list[tuple[int, int, int]] = []
         for batch_idx, st in enumerate(range(0, total, chunk_size), start=1):
             ed = min(total, st + chunk_size)
@@ -619,31 +620,56 @@ def run_lecture_content_from_xlsx(
                     e,
                 ),
             )
-            parsed = _parse_items_json(content)
-            by_out: dict[int, tuple[str, str]] = {}
-            for it in parsed:
-                rk = it.get("行号")
-                try:
-                    rnum = int(rk)  # type: ignore[arg-type]
-                except (TypeError, ValueError):
-                    continue
-                by_out[rnum] = (
-                    str(it.get("要点", "") or "").strip(),
-                    str(it.get("讲课内容", "") or "").strip(),
+            try:
+                parsed = _parse_items_json(content)
+            except json.JSONDecodeError as e:
+                _log.warning(
+                    "lecture-content(xlsx) batch=%s/%s JSON 解析失败，整段回复写入「讲课内容」（要点留空）: %s",
+                    bix,
+                    n_batches,
+                    e,
                 )
+                parsed = None
 
-            flat_csv: list[dict[str, Any]] = []
-            for excel_row, d in chunk:
-                t, _, _ = qa_from_export_row(d)
-                pt, lc = by_out.get(int(excel_row), ("", ""))
-                flat_csv.append(
-                    {
-                        "行号": int(excel_row),
-                        "题号": t,
-                        "要点": pt,
-                        "讲课内容": lc,
-                    }
-                )
+            flat_csv: list[dict[str, Any]]
+            if parsed is None:
+                raw_lc = content.strip()
+                flat_csv = []
+                for excel_row, d in chunk:
+                    t, _, _ = qa_from_export_row(d)
+                    flat_csv.append(
+                        {
+                            "行号": int(excel_row),
+                            "题号": t,
+                            "要点": "",
+                            "讲课内容": raw_lc,
+                        }
+                    )
+            else:
+                by_out: dict[int, tuple[str, str]] = {}
+                for it in parsed:
+                    rk = it.get("行号")
+                    try:
+                        rnum = int(rk)  # type: ignore[arg-type]
+                    except (TypeError, ValueError):
+                        continue
+                    by_out[rnum] = (
+                        str(it.get("要点", "") or "").strip(),
+                        str(it.get("讲课内容", "") or "").strip(),
+                    )
+
+                flat_csv = []
+                for excel_row, d in chunk:
+                    t, _, _ = qa_from_export_row(d)
+                    pt, lc = by_out.get(int(excel_row), ("", ""))
+                    flat_csv.append(
+                        {
+                            "行号": int(excel_row),
+                            "题号": t,
+                            "要点": pt,
+                            "讲课内容": lc,
+                        }
+                    )
             try:
                 with csv_lock:
                     append_lecture_content_row_csv(cout, flat_csv)

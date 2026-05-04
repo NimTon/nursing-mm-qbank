@@ -1,6 +1,10 @@
 from __future__ import annotations
 
-from mm_qbank.pipeline.vlm_merge import merge_sort_key_for_row, merge_vlm_items_by_tihao
+from mm_qbank.pipeline.vlm_merge import (
+    aggregate_bucket_key,
+    merge_sort_key_for_row,
+    merge_vlm_items_by_tihao,
+)
 
 
 def test_merge_vlm_by_tihao() -> None:
@@ -17,6 +21,23 @@ def test_merge_vlm_by_tihao() -> None:
     d2 = next(x for x in m if x["题号"] == "2")
     assert d2["题目类型"] == "未知"
     assert d2["问题"] == "Q2" and d2["解析"] == ""
+
+
+def test_merge_same_tihao_different_question_kind_stays_separate() -> None:
+    """单选第 10 题与多选第 10 题题号相同但不得合并为一题。"""
+    items = [
+        {"题号": "10", "类型": "问题", "题目类型": "单选", "内容": "单选题干"},
+        {"题号": "10", "类型": "解析", "题目类型": "单选", "内容": "单选解析"},
+        {"题号": "10", "类型": "问题", "题目类型": "多选", "内容": "多选题干"},
+        {"题号": "10", "类型": "解析", "题目类型": "多选", "内容": "多选解析"},
+    ]
+    m = merge_vlm_items_by_tihao(items)
+    assert len(m) == 2
+    by_kind = {x["题目类型"]: x for x in m}
+    assert "单选" in by_kind and "多选" in by_kind
+    assert "单选题干" in by_kind["单选"]["问题"] and "单选解析" in by_kind["单选"]["解析"]
+    assert "多选题干" in by_kind["多选"]["问题"] and "多选解析" in by_kind["多选"]["解析"]
+    assert aggregate_bucket_key("10", "单选") != aggregate_bucket_key("10", "多选")
 
 
 def test_merge_sort_order_kind_before_tihao() -> None:

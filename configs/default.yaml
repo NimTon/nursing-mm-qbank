@@ -20,7 +20,6 @@ vlm:
   timeout_seconds: 300.0
 refine:
   model: qwen3-max
-  batch_size: 1
   max_workers: 8
   temperature: 0.2
   stream_refine: false
@@ -31,14 +30,12 @@ refine:
   timeout_seconds: 300.0
 lecture_content:
   model: null
-  batch_size: 1
   max_workers: 4
   temperature: 0.4
   web_search: true
   timeout_seconds: 300.0
 lecture_tips:
   model: null
-  batch_size: 1
   max_workers: 8
   temperature: 0.35
   web_search: true

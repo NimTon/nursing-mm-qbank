@@ -10,7 +10,6 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from threading import Event, Lock, Thread
 from typing import Any, cast
-import math
 
 from mm_qbank.config import load_config, llm_text_settings, project_root
 from mm_qbank.io.csv_out import append_refined_rows_to_csv
@@ -19,7 +18,12 @@ from mm_qbank.llm.client import OpenAICompatClient
 from mm_qbank.llm.jsonutil import parse_json_object
 from mm_qbank.llm.retry import call_with_retries_timeout
 from mm_qbank.pipeline.llm_compose_run import _manifest_out_root
-from mm_qbank.pipeline.vlm_merge import merge_sort_key_for_row, merge_sort_key_tihao_and_kind, merge_vlm_items_by_tihao
+from mm_qbank.pipeline.vlm_merge import (
+    aggregate_bucket_key,
+    merge_sort_key_for_aggregate_bucket,
+    merge_sort_key_for_row,
+    merge_vlm_items_by_tihao,
+)
 from mm_qbank.pipeline.vlm_text_run import run_vlm_text_only
 from mm_qbank.prompts_loader import refine_system, refine_user_payload
 
@@ -49,7 +53,11 @@ def _normalize_out_item_flexible(
     """
     tihao = str(raw.get("题号", "") or "").strip()
     base = _tihao_base(tihao)
-    m = merged_map.get(base, {"题号": base, "问题": "", "解析": "", "题目类型": ""})
+    kind_from_raw = str(raw.get("题目类型") or "").strip()
+    rk = aggregate_bucket_key(base, kind_from_raw)
+    m = merged_map.get(rk)
+    if m is None:
+        m = merged_map.get(base, {"题号": base, "问题": "", "解析": "", "题目类型": ""})
     原问 = str(raw.get("原问题") or "").strip() or str(m.get("问题") or "").strip()
     原析 = str(raw.get("原解析") or "").strip() or str(m.get("解析") or "").strip()
     题型 = str(raw.get("题目类型") or "").strip() or str(m.get("题目类型") or "").strip() or "未知"
@@ -116,7 +124,12 @@ def _load_done_tihao_from_csv(path: Path) -> set[str]:
                     continue
                 n = str(row.get("题号", "") or "").strip()
                 if n:
-                    done.add(n)
+                    kt = str(row.get("题目类型", "") or "").strip()
+                    if kt:
+                        done.add(aggregate_bucket_key(n, kt))
+                    else:
+                        done.add(n)
+                        done.add(aggregate_bucket_key(n, "未知"))
     except Exception as e:  # noqa: BLE001
         _log.warning("读取已存在 CSV 失败（将不跳过已处理题）：%s (%s)", p, e)
         return set()
@@ -266,10 +279,6 @@ def run_refine_vlm_merged(
     if done_tihao:
         _log.info("检测到已存在 CSV，将跳过已处理题号数=%s -> %s", len(done_tihao), str(cout))
 
-    batch_size = int(rcfg.get("batch_size", 20) or 20)
-    if batch_size < 1:
-        batch_size = 20
-
     flat: list[dict[str, Any]] = []
     # 关键：VLM 完整跑完后，跨页按题号聚合成「题目块」，后续不再按页；再按题目数分批请求 LLM 修正与导出 xlsx。
     agg: dict[str, dict[str, Any]] = {}
@@ -299,9 +308,13 @@ def run_refine_vlm_merged(
             n = str(m.get("题号", "") or "").strip()
             if not n:
                 continue
-            a = agg.get(n)
+            qt = str(m.get("题目类型", "") or "").strip() or "未知"
+            rk = aggregate_bucket_key(n, qt)
+            if rk in done_tihao:
+                continue
+            a = agg.get(rk)
             if a is None:
-                agg[n] = {
+                agg[rk] = {
                     "题号": n,
                     "问题_parts": [],
                     "解析_parts": [],
@@ -309,10 +322,9 @@ def run_refine_vlm_merged(
                     "page_ids": [],
                     "source_images": [],
                 }
-                a = agg[n]
+                a = agg[rk]
             q = str(m.get("问题", "") or "").strip()
             r = str(m.get("解析", "") or "").strip()
-            qt = str(m.get("题目类型", "") or "").strip()
             if qt and not str(a.get("题目类型") or "").strip():
                 a["题目类型"] = qt
             if q:
@@ -325,13 +337,13 @@ def run_refine_vlm_merged(
                 a["source_images"].append(src)
 
     merged_all: list[dict[str, Any]] = []
-    for n in sorted(
-        agg.keys(),
-        key=lambda k: merge_sort_key_tihao_and_kind(k, str(agg[k].get("题目类型") or "")),
-    ):
-        if n in done_tihao:
+    for rk in sorted(agg.keys(), key=merge_sort_key_for_aggregate_bucket):
+        if rk in done_tihao:
             continue
-        a = agg[n]
+        a = agg[rk]
+        n = str(a.get("题号") or "").strip()
+        if not n:
+            continue
         merged_all.append(
             {
                 "题号": n,
@@ -351,7 +363,10 @@ def run_refine_vlm_merged(
         rsys = refine_system(include_lecture_tips=include_lecture_tips)
         total = len(merged_all)
         merged_map: dict[str, dict[str, str]] = {
-            str(x.get("题号") or "").strip(): {
+            aggregate_bucket_key(
+                str(x.get("题号") or "").strip(),
+                str(x.get("题目类型") or "").strip() or "未知",
+            ): {
                 "题号": str(x.get("题号") or "").strip(),
                 "题目类型": str(x.get("题目类型") or "").strip() or "未知",
                 "问题": str(x.get("问题") or ""),
@@ -363,14 +378,7 @@ def run_refine_vlm_merged(
 
         raw_max_workers = rcfg.get("max_workers")
 
-        # 分批策略：
-        # - total > batch_size：按 batch_size 切批；并发由 max_workers 限制
-        # - total <= batch_size：避免只有 1 批导致“看起来不并行”，改为按 max_workers 尽量均分切成多批并行
-        if total <= batch_size:
-            target_tasks = _cap_workers(total, raw_max_workers)
-            chunk_size = int(math.ceil(total / target_tasks)) if target_tasks > 0 else total
-        else:
-            chunk_size = batch_size
+        chunk_size = 1
 
         batches: list[tuple[int, int, int]] = []
         for batch_idx, st in enumerate(range(0, total, chunk_size), start=1):
@@ -380,11 +388,9 @@ def run_refine_vlm_merged(
         n_batches = len(batches)
         max_rw = _cap_workers(n_batches, raw_max_workers)
         _log.info(
-            "vlm-refine 题块总数=%s，批次数=%s（chunk_size=%s, batch_size=%s），并行：max_workers=%s",
+            "vlm-refine 题块总数=%s，批次数=%s（每批 1 题），并行：max_workers=%s",
             total,
             n_batches,
-            chunk_size,
-            batch_size,
             max_rw,
         )
 
@@ -465,12 +471,13 @@ def run_refine_vlm_merged(
             for oi in out_items:
                 tihao = str(oi.get("题号", "") or "").strip()
                 base = _tihao_base(tihao)
-                meta = agg.get(base)
+                kind_oi = str(oi.get("题目类型") or "").strip() or "未知"
+                rk = aggregate_bucket_key(base, kind_oi)
+                meta = agg.get(rk) or agg.get(aggregate_bucket_key(base, "未知"))
                 if meta is None:
                     continue
-                m = merged_map.get(base, {"题号": base, "问题": "", "解析": "", "题目类型": ""})
                 row = _normalize_out_item_flexible(
-                    {base: m}, oi, include_lecture_tips=include_lecture_tips
+                    merged_map, oi, include_lecture_tips=include_lecture_tips
                 )
                 row["page_id"] = ",".join(meta.get("page_ids") or [])
                 imgs = meta.get("source_images") or []
@@ -592,9 +599,6 @@ def run_vlm_text_and_refine_streaming(
     export_csv_xlsx_lc = bool(rcfg.get("lecture_content_after_refine", False))
     temp = float(rcfg.get("temperature", 0.2))
     timeout = float(rcfg.get("timeout_seconds", 180.0))
-    batch_size = int(rcfg.get("batch_size", 20) or 20)
-    if batch_size < 1:
-        batch_size = 20
 
     default_headers: dict[str, str] | None = None
     burl = (tl.get("base_url") or "") or ""
@@ -705,10 +709,10 @@ def run_vlm_text_and_refine_streaming(
 
         def _flush_ready(force: bool = False) -> None:
             nonlocal batch_idx, _n_refined
-            while ready and (force or len(ready) >= batch_size):
+            while ready and (force or len(ready) >= 1):
                 batch_idx += 1
-                chunk = ready[:batch_size]
-                del ready[: min(batch_size, len(chunk))]
+                chunk = ready[:1]
+                del ready[:1]
                 chunk_simple = [
                     {
                         "题号": x["题号"],
@@ -774,11 +778,13 @@ def run_vlm_text_and_refine_streaming(
             merged_page = merge_vlm_items_by_tihao(cast(list, items))
             for m in merged_page:
                 n = str(m.get("题号", "") or "").strip()
-                if not n or n in done_tihao or n in sent:
+                qt = str(m.get("题目类型", "") or "").strip() or "未知"
+                rk = aggregate_bucket_key(n, qt)
+                if not n or rk in done_tihao or rk in sent:
                     continue
-                a = buf.get(n)
+                a = buf.get(rk)
                 if a is None:
-                    buf[n] = {
+                    buf[rk] = {
                         "题号": n,
                         "问题_parts": [],
                         "解析_parts": [],
@@ -786,10 +792,9 @@ def run_vlm_text_and_refine_streaming(
                         "page_ids": [],
                         "source_images": [],
                     }
-                    a = buf[n]
+                    a = buf[rk]
                 qtxt = str(m.get("问题", "") or "").strip()
                 atxt = str(m.get("解析", "") or "").strip()
-                qt = str(m.get("题目类型", "") or "").strip()
                 if qt and not str(a.get("题目类型") or "").strip():
                     a["题目类型"] = qt
                 if qtxt:
@@ -814,8 +819,8 @@ def run_vlm_text_and_refine_streaming(
                             "source_images": a["source_images"],
                         }
                     )
-                    sent.add(n)
-                    buf.pop(n, None)
+                    sent.add(rk)
+                    buf.pop(rk, None)
             _flush_ready(force=False)
 
         _flush_ready(force=True)
@@ -968,11 +973,13 @@ def run_refine_from_compose_jsonl(
             else:
                 seq += 1
                 n = str(seq)
-            if not n or n in done_tihao:
+            tk = str(it.get("type", "") or "").strip() or "未知"
+            rk = aggregate_bucket_key(n, tk)
+            if not n or rk in done_tihao:
                 continue
-            a = agg.get(n)
+            a = agg.get(rk)
             if a is None:
-                agg[n] = {
+                agg[rk] = {
                     "题号": n,
                     "问题_parts": [],
                     "解析_parts": [],
@@ -980,8 +987,7 @@ def run_refine_from_compose_jsonl(
                     "page_ids": [],
                     "source_images": [],
                 }
-                a = agg[n]
-            tk = str(it.get("type", "") or "").strip()
+                a = agg[rk]
             if tk and not str(a.get("题目类型") or "").strip():
                 a["题目类型"] = tk
             if q:
@@ -994,11 +1000,11 @@ def run_refine_from_compose_jsonl(
                 a["source_images"].append(src)
 
     merged_all: list[dict[str, Any]] = []
-    for n in sorted(
-        agg.keys(),
-        key=lambda k: merge_sort_key_tihao_and_kind(k, str(agg[k].get("题目类型") or "")),
-    ):
-        a = agg[n]
+    for rk in sorted(agg.keys(), key=merge_sort_key_for_aggregate_bucket):
+        a = agg[rk]
+        n = str(a.get("题号") or "").strip()
+        if not n:
+            continue
         merged_all.append(
             {
                 "题号": n,
@@ -1019,14 +1025,7 @@ def run_refine_from_compose_jsonl(
         rsys = refine_system(include_lecture_tips=include_lecture_tips)
         total = len(merged_all)
         raw_max_workers = rcfg.get("max_workers")
-        batch_size = int(rcfg.get("batch_size", 20) or 20)
-        if batch_size < 1:
-            batch_size = 20
-        if total <= batch_size:
-            target_tasks = _cap_workers(total, raw_max_workers)
-            chunk_size = int(math.ceil(total / target_tasks)) if target_tasks > 0 else total
-        else:
-            chunk_size = batch_size
+        chunk_size = 1
         batches: list[tuple[int, int, int]] = []
         for batch_idx, st in enumerate(range(0, total, chunk_size), start=1):
             ed = min(total, st + chunk_size)
@@ -1034,11 +1033,9 @@ def run_refine_from_compose_jsonl(
         n_batches = len(batches)
         max_rw = _cap_workers(n_batches, raw_max_workers)
         _log.info(
-            "compose-refine 题块总数=%s，批次数=%s（chunk_size=%s, batch_size=%s），并行：max_workers=%s",
+            "compose-refine 题块总数=%s，批次数=%s（每批 1 题），并行：max_workers=%s",
             total,
             n_batches,
-            chunk_size,
-            batch_size,
             max_rw,
         )
         csv_lock = Lock()
@@ -1104,7 +1101,10 @@ def run_refine_from_compose_jsonl(
             out_items = _parse_refine_response(content)
             flat_part: list[dict[str, Any]] = []
             merged_map_batch: dict[str, dict[str, str]] = {
-                str(x.get("题号") or "").strip(): {
+                aggregate_bucket_key(
+                    str(x.get("题号") or "").strip(),
+                    str(x.get("题目类型") or "").strip() or "未知",
+                ): {
                     "题号": str(x.get("题号") or "").strip(),
                     "题目类型": str(x.get("题目类型") or "").strip() or "未知",
                     "问题": str(x.get("问题") or ""),
@@ -1114,12 +1114,19 @@ def run_refine_from_compose_jsonl(
                 if str(x.get("题号") or "").strip()
             }
             meta_map_batch: dict[str, dict[str, Any]] = {
-                str(x.get("题号") or "").strip(): x for x in chunk if str(x.get("题号") or "").strip()
+                aggregate_bucket_key(
+                    str(x.get("题号") or "").strip(),
+                    str(x.get("题目类型") or "").strip() or "未知",
+                ): x
+                for x in chunk
+                if str(x.get("题号") or "").strip()
             }
             for oi in out_items:
                 tihao = str(oi.get("题号", "") or "").strip()
                 base = _tihao_base(tihao)
-                meta = meta_map_batch.get(base)
+                kind_oi = str(oi.get("题目类型") or "").strip() or "未知"
+                rk = aggregate_bucket_key(base, kind_oi)
+                meta = meta_map_batch.get(rk) or meta_map_batch.get(aggregate_bucket_key(base, "未知"))
                 if meta is None:
                     continue
                 row = _normalize_out_item_flexible(
