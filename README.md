@@ -12,8 +12,8 @@ pip install -e .
 
 ## 配置
 
-- 项目根目录 **`.env`**：整页读图用 **`VLM_BASE_URL` + `VLM_API_KEY`**（及可选 `VLM_MODEL`）；拆题与教材向修正用 **`LLM_BASE_URL` + `LLM_API_KEY`**（及可选 `LLM_MODEL`），可与 VLM 不同服务。见 `.env.example`。
-- **`configs/default.yaml`**：预处理 `preprocess`（VLM 读图前用）、`vlm`、`llm`（拆题温度）、`refine`（修正步温度与 **`web_search` 是否希望走联网**；类 DashScope 在部分线路上会附加联网请求头，**是否真正联网**以你控制台与官方文档为准）。
+- 项目根目录 **`.env`**：网关与模型名——整页读图 **`VLM_BASE_URL` + `VLM_API_KEY` + `VLM_MODEL`**；拆题/修正/讲课 **`LLM_BASE_URL` + `LLM_API_KEY` + `LLM_MODEL`**（可与 VLM 不同服务）。见 `.env.example`。
+- **`configs/default.yaml`**：预处理 `preprocess`、并发、温度、**`web_search`** 等；**模型名已统一放在 `.env`**，不再从 yaml 读取。
 
 ## 主流程
 
@@ -61,13 +61,15 @@ mm-qbank-gui
 
 ## 打包为 Windows 可执行文件（exe）
 
-项目提供 PyInstaller 的整项目打包配置（生成 `dist/mm-qbank-gui/mm-qbank-gui.exe`）：
+项目提供 PyInstaller 的整项目打包配置：
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\build.ps1
 ```
 
-- 产物是 **onedir**：请把 `dist/mm-qbank-gui/` 整个文件夹拷贝到其它机器运行。
+- 产物：
+  - `dist/mm-qbank-gui/` — onedir，可直接拷贝整个文件夹运行
+  - `dist/mm-qbank-gui-setup.exe` — **自解压 exe**（默认生成，需本机安装 [7-Zip](https://www.7-zip.org/)：`winget install 7zip.7zip`）；用户双击解压后运行 `mm-qbank-gui\mm-qbank-gui.exe`
 - 运行时会从 **exe 同目录**读取 `configs/` 与 `.env`（如需改 key/模型，放一个 `.env` 在 exe 旁边即可）。
 
 ## 其他

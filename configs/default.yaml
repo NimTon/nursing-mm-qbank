@@ -1,42 +1,41 @@
 preprocess:
   max_long_edge: 1000
   tone_mode: raw
-  auto_exif: true
-  auto_rotate: true
-  rotate_degrees: 0
+  auto_rotate_ocr:
+    enabled: true
+    max_long_edge: 1200
   deskew:
     enabled: true
     max_abs_degrees: 20
     min_abs_degrees: 0.35
-page_text:
-  subdir: pages
-  manifest: pages.jsonl
-vlm:
-  model: qwen3.5-flash
-  max_workers: 8
-  max_long_edge: 1500
-  use_preprocess: false
-  temperature: 0.1
-  timeout_seconds: 300.0
+  perspective:
+    enabled: true
+    min_area_ratio: 0.08
+    approx_epsilon_ratios:
+    - 0.02
+    - 0.03
+    - 0.045
+    - 0.06
+    max_detect_long_edge: 1200
+    rect_area_expand_ratio: 0.2
+lecture_scan:
+  vlm:
+    max_workers: 4
+    use_preprocess: true
+    temperature: 0.1
+    timeout_seconds: 300.0
+  assemble:
+    temperature: 0.2
+    timeout_seconds: 300.0
+  lecture:
+    max_workers: 4
 refine:
-  model: qwen3-max
   max_workers: 8
   temperature: 0.2
-  stream_refine: false
-  use_kb: false
   web_search: true
-  lecture_tips_with_refine: true
-  lecture_content_after_refine: true
   timeout_seconds: 300.0
 lecture_content:
-  model: null
   max_workers: 4
   temperature: 0.4
-  web_search: true
-  timeout_seconds: 300.0
-lecture_tips:
-  model: null
-  max_workers: 8
-  temperature: 0.35
   web_search: true
   timeout_seconds: 300.0

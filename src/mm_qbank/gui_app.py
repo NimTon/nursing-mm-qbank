@@ -1,16 +1,7 @@
 """
-图形界面：
-- VLM 整页转写（带预处理：EXIF 纠正 + 自动 0/90/180/270 旋转 + deskew）
-- VLM 结果流式落盘（pages.jsonl 逐页写入）
-- 按题号缓冲：同题「问题+解析」凑齐就触发教材向修正（凑满一批就请求），并流式追加写 CSV 便于断点续跑
-- 结果 xlsx「讲师提醒」与教材向修正共用「联网检索」等 LLM 运行时开关（见界面「LLM 参数」）；勾选后立即写入 ``configs/default.yaml``
-- 最终导出 xlsx/jsonl；可选「讲课内容」阶段另存 Word 讲义（Microsoft YaHei UI / 列表与 **加粗**）
-- 可选「按文件夹分层分批」：深度优先枚举每个「当前层含直属图片」的文件夹，每轮仅处理该层图片（子目录内图片另起一轮），输出子目录名为 ``001_根名-子路径``（段之间用 ``-``，如 ``001_1-3-3``）
+图形界面：教师讲解 / 题目修正 两分支（共用 scan → assemble 流程）。
 
-运行：
-  mm-qbank-gui
-或：
-  python -m mm_qbank.gui_app
+运行：mm-qbank-gui  或  python -m mm_qbank.gui_app
 """
 
 from __future__ import annotations
@@ -18,21 +9,21 @@ from __future__ import annotations
 import logging
 import os
 import queue
+import re
 import shutil
 import subprocess
 import sys
 import tempfile
 import threading
 import time
-from datetime import datetime
 from copy import deepcopy
+from datetime import datetime
 from pathlib import Path
 from typing import Any
+
 import yaml
-import re
 
 if sys.platform == "win32":
-    # 1440p/高分屏下避免 Tk 被系统拉伸导致字体发糊：尽量启用 Per-Monitor DPI Aware
     try:
         import ctypes
 
@@ -69,23 +60,42 @@ except Exception:  # noqa: BLE001
     sv_ttk = None  # type: ignore[assignment]
 
 from mm_qbank import __version__
-from mm_qbank.config import load_config, project_root
+from mm_qbank.config import load_config, llm_text_settings, project_root, vlm_settings
 from mm_qbank.logging_utils import configure_logging
-from mm_qbank.pipeline.llm_compose_run import run_llm_compose_manifest
-from mm_qbank.pipeline.refine_vlm_run import (
-    run_refine_vlm_merged,
-    run_vlm_text_and_refine_streaming,
-)
+from mm_qbank.pipeline.lecture_scan_run import run_correction_scan_pipeline, run_lecture_scan_pipeline
 from mm_qbank.pipeline.scan_pages import list_input_images
-from mm_qbank.pipeline.vlm_text_run import run_vlm_text_only
 
 _LOG_QUEUE: "queue.Queue[str] | None" = None
+_IMG_EXTS = frozenset({".png", ".jpg", ".jpeg", ".bmp", ".webp"})
 
 
 class _TextQueueHandler(logging.Handler):
     def emit(self, record: logging.LogRecord) -> None:  # noqa: N802
         if _LOG_QUEUE is not None:
             _LOG_QUEUE.put(self.format(record) + "\n")
+
+
+def _env_startup_hint() -> str:
+    vs = vlm_settings()
+    ls = llm_text_settings()
+    missing: list[str] = []
+    if not vs.get("api_key"):
+        missing.append("VLM_API_KEY")
+    if not vs.get("base_url"):
+        missing.append("VLM_BASE_URL")
+    if not ls.get("api_key"):
+        missing.append("LLM_API_KEY")
+    if not ls.get("base_url"):
+        missing.append("LLM_BASE_URL")
+    if missing:
+        return f"请在 exe 同目录 .env 中配置：{', '.join(missing)}。\n"
+    vlm_m = vs.get("mm_model") or "?"
+    llm_m = ls.get("text_model") or "?"
+    hint = f"已加载 .env：VLM={vlm_m}，LLM={llm_m}。"
+    base = f"{vs.get('base_url') or ''}{ls.get('base_url') or ''}".lower()
+    if "dashscope" in base and (vlm_m.startswith("gpt-") or llm_m.startswith("gpt-")):
+        hint += " 阿里云网关请在 .env 设置 VLM_MODEL=qwen-vl-max、LLM_MODEL=qwen-plus（勿用默认 gpt-4o）。"
+    return hint + "\n"
 
 
 def _reveal_dir(path: Path) -> None:
@@ -102,29 +112,18 @@ def _reveal_dir(path: Path) -> None:
 
 
 def _list_images(d: Path) -> list[Path]:
-    """递归列出目录下全部图片（与流水线 ``list_input_images`` 一致）。"""
     if not d.is_dir():
         return []
     return list_input_images(d)
 
 
-_IMG_EXTS = frozenset({".png", ".jpg", ".jpeg", ".bmp", ".webp"})
-
-
 def _list_direct_images_in_dir(d: Path) -> list[Path]:
-    """仅当前文件夹下一层的图片文件（不递归子目录）。"""
     if not d.is_dir():
         return []
-    return sorted(
-        p for p in d.iterdir() if p.is_file() and p.suffix.lower() in _IMG_EXTS
-    )
+    return sorted(p for p in d.iterdir() if p.is_file() and p.suffix.lower() in _IMG_EXTS)
 
 
 def _dirs_with_direct_images_dfs(root: Path) -> list[Path]:
-    """
-    深度优先列出：树中每个「当前层至少有一张直属图片」的文件夹（含根）。
-    同级目录按名称排序。
-    """
     if not root.is_dir():
         return []
     rt = root.resolve()
@@ -133,44 +132,37 @@ def _dirs_with_direct_images_dfs(root: Path) -> list[Path]:
     def walk(d: Path) -> None:
         if _list_direct_images_in_dir(d):
             out.append(d)
-        subs = sorted((p for p in d.iterdir() if p.is_dir()), key=lambda p: p.name.lower())
-        for sub in subs:
+        for sub in sorted((p for p in d.iterdir() if p.is_dir()), key=lambda p: p.name.lower()):
             walk(sub)
 
     walk(rt)
     return out
 
 
+def _safe_name(name: str) -> str:
+    s = re.sub(r"[\\/:*?\"<>|]+", "_", (name or "").strip())
+    s = re.sub(r"\s+", "_", s)
+    return s or "input"
+
+
 def _batch_output_slug(batch_src: Path, root: Path) -> str:
-    """用于输出子目录名 / 导出文件名后缀：根名与相对路径段用 ``-`` 连接（如 ``1-3-3``）。"""
-    bs = batch_src.resolve()
-    rt = root.resolve()
+    bs, rt = batch_src.resolve(), root.resolve()
     root_seg = _safe_name(rt.name) or "root"
     if bs == rt:
         return root_seg
     try:
         rel = bs.relative_to(rt)
     except ValueError:
-        tail = _safe_name(bs.name) or "batch"
-        return f"{root_seg}-{tail}"
+        return f"{root_seg}-{_safe_name(bs.name) or 'batch'}"
     parts = [root_seg] + [_safe_name(p) or "dir" for p in rel.parts]
     return "-".join(parts) or "batch"
 
 
 def _folder_batch_display_name(batch_src: Path, root: Path) -> str:
-    """与输出 slug 一致，便于日志与完成提示对照。"""
     return _batch_output_slug(batch_src, root)
 
 
-def _safe_name(name: str) -> str:
-    s = (name or "").strip()
-    s = re.sub(r"[\\/:*?\"<>|]+", "_", s)
-    s = re.sub(r"\s+", "_", s)
-    return s or "input"
-
-
 def _install_gui_mascot_strip(parent: tk.Misc, font: tuple[Any, ...]) -> None:
-    """在 parent 内放一条循环颜文字（应援棒挥动）；假定 parent 已按右上排版。"""
     fr = ttk.Frame(parent)
     fr.pack(fill=tk.X, anchor=tk.E, pady=(2, 0))
     frames = (
@@ -196,7 +188,7 @@ def _install_gui_mascot_strip(parent: tk.Misc, font: tuple[Any, ...]) -> None:
         pass
     lbl.pack(anchor=tk.E, padx=0, pady=0)
     idx = 0
-    after_id: list[str | int | None] = [None]
+    after_id: list[Any] = [None]
 
     def tick() -> None:
         nonlocal idx
@@ -207,8 +199,7 @@ def _install_gui_mascot_strip(parent: tk.Misc, font: tuple[Any, ...]) -> None:
             return
         idx = (idx + 1) % len(frames)
         lbl.config(text=frames[idx])
-        w = parent.winfo_toplevel()
-        after_id[0] = w.after(480, tick)
+        after_id[0] = parent.winfo_toplevel().after(480, tick)
 
     def on_destroy(_: tk.Event[Any]) -> None:
         aid = after_id[0]
@@ -227,52 +218,36 @@ def main() -> None:
     global _LOG_QUEUE  # noqa: PLW0603
 
     if tk is None:
-        print("当前解释器未带 tkinter，请使用官方 Python（含 Tcl/Tk）。", file=sys.stderr)  # noqa: T201
+        print("当前解释器未带 tkinter。", file=sys.stderr)  # noqa: T201
         raise SystemExit(1) from _tk_import_error
 
     load_dotenv(project_root() / ".env")
-
     _LOG_QUEUE = queue.Queue()
-    # 必须先配置根 logger（会清空已有 handlers），再挂 GUI 的队列 handler；
-    # 若先 addHandler 再 configure_logging，后者会 clear 掉 _TextQueueHandler，导致界面收不到与终端同等的日志。
-    # GUI 默认 INFO，可在界面内切换 INFO/DEBUG/WARNING
     configure_logging(verbose=False, quiet=False)
     th = _TextQueueHandler()
     th.setLevel(logging.INFO)
-    th.setFormatter(
-        logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s", "%Y-%m-%d %H:%M:%S")
-    )
+    th.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s", "%Y-%m-%d %H:%M:%S"))
     logging.getLogger().addHandler(th)
     for name in ("httpx", "httpcore", "openai", "urllib3"):
         logging.getLogger(name).setLevel(logging.WARNING)
-    for name in ("mm_qbank",):
-        logging.getLogger(name).setLevel(logging.INFO)
 
     root = tk.Tk()
-    root.title(
-        f"nursing-mm-qbank v{__version__} · VLM 转写 · 教材修正 · 讲师提醒 · 讲课内容（Word）"
-    )
-    root.geometry("1200x800")
+    root.title(f"nursing-mm-qbank v{__version__} · 教师讲解 · 题目修正")
+    root.geometry("1200x780")
     root.minsize(720, 520)
-    # 现代 ttk 主题（优先启用；缺依赖时自动降级）
     if sv_ttk is not None:
         try:
             sv_ttk.set_theme("light")
-            logging.getLogger(__name__).info("GUI theme: sv-ttk light")
         except Exception:  # noqa: BLE001
-            logging.getLogger(__name__).warning("GUI theme: sv-ttk 启用失败，将使用默认 ttk 主题", exc_info=True)
-    else:
-        logging.getLogger(__name__).info("GUI theme: default ttk (sv-ttk not installed)")
+            pass
 
-    # 统一字体层级：主 > 次 > 注释（避免“字体倒挂”）
+    _font_main: tuple[Any, ...] | None = None
+    _font_mono: tuple[Any, ...] | None = None
     try:
         import tkinter.font as tkfont
 
         base_family = "Segoe UI" if sys.platform == "win32" else "TkDefaultFont"
         main_size = 10
-        # 统一：容器内所有字号都使用 main_size
-        sub_size = main_size
-        small_size = main_size
         mono_family = "Consolas" if os.name == "nt" else "monospace"
 
         tkfont.nametofont("TkDefaultFont").configure(family=base_family, size=main_size)
@@ -283,15 +258,11 @@ def main() -> None:
         tkfont.nametofont("TkFixedFont").configure(family=mono_family, size=main_size)
 
         _font_main = (base_family, main_size)
-        _font_sub = _font_main
-        _font_small = _font_main
         _font_mono = (mono_family, main_size)
 
         style = ttk.Style()
         style.configure(".", font=_font_main)
         style.configure("TLabelframe.Label", font=_font_main)
-        # 某些主题（尤其是 sv-ttk）会对部分 ttk 样式/子控件使用单独字体；
-        # 这里显式覆盖常见控件，避免出现“仍有小字体”的情况。
         for sty in (
             "TLabel",
             "TButton",
@@ -306,31 +277,23 @@ def main() -> None:
         ):
             style.configure(sty, font=_font_main)
 
-        # Combobox 弹出下拉列表是一个 Listbox，不一定吃 ttk Style，需用 option_add 强制字体。
         root.option_add("*TCombobox*Listbox.font", _font_main)
         root.option_add("*Listbox.font", _font_main)
     except Exception:  # noqa: BLE001
-        _font_main = None
-        _font_sub = None
-        _font_small = None
-        _font_mono = None
+        style = ttk.Style()
 
-    # --- 主界面容器（不使用整体滚动条）
     content = ttk.Frame(root)
     content.pack(fill=tk.BOTH, expand=True)
 
     work_dir: list[Path | None] = [None]
-    is_temp: list[bool] = [False]
     last_out: list[Path | None] = [None]
-    # 运行/暂停/取消：与 vlm_text_run 内「页与页之间」协作用；单次模型请求中无法暂停或结束直到该页返回
     run_cancel = threading.Event()
     user_paused: list[bool] = [False]
     is_running: list[bool] = [False]
-    # ``work()`` 嵌套在 ``on_run`` 内，无法直接闭包到下方 ``_persist_llm_flags_from_gui``，用单元素列表转发
     gui_llm_persist_cb: list[Any] = []
     folder_batch_var = tk.BooleanVar(value=False)
+    pipeline_mode_var = tk.StringVar(value="lecture")
 
-    # --- 顶部：输入（不显示缩略图/列表）
     fr_top = ttk.LabelFrame(content, text="图片输入", padding=8)
     fr_top.pack(fill=tk.X, padx=8, pady=4)
     fr_top_bar = ttk.Frame(fr_top)
@@ -339,182 +302,142 @@ def main() -> None:
     fr_top_right.pack(side=tk.RIGHT, padx=(4, 0))
     fr_ver = ttk.Frame(fr_top_right)
     fr_ver.pack(anchor=tk.E)
-    ttk.Label(fr_ver, text=f"v{__version__}", foreground="#666", font=_font_small).pack(side=tk.LEFT, padx=(0, 6))
     ttk.Label(
         fr_ver,
-        text="转写 · 修正 · 讲师提醒 · 讲课内容（Word）",
+        text=f"v{__version__}",
         foreground="#666",
-        font=_font_small,
+    ).pack(side=tk.LEFT, padx=(0, 6))
+    ttk.Label(
+        fr_ver,
+        text="教师讲解 · 题目修正",
+        foreground="#666",
     ).pack(side=tk.LEFT)
-    _mono_mascot: tuple[Any, ...] = _font_mono or (
-        ("Consolas", 9) if os.name == "nt" else ("monospace", 9)
-    )
-    _install_gui_mascot_strip(fr_top_right, _mono_mascot)
+    if _font_mono is not None:
+        _install_gui_mascot_strip(fr_top_right, _font_mono)
     btn_dir = ttk.Button(fr_top_bar, text="选择图片文件夹…")
-    btn_dir.pack(side=tk.LEFT, padx=(0, 8))
-    btn_files = ttk.Button(fr_top_bar, text="选择图片（可多选）…")
-    btn_files.pack(side=tk.LEFT)
+    btn_dir.pack(side=tk.LEFT)
     lbl_in = ttk.Label(fr_top, text="未选择", foreground="#666")
     lbl_in.pack(anchor=tk.W, pady=(4, 0))
-    lbl_thumb_note = ttk.Label(
-        fr_top,
-        text=(
-            "选择含图的文件夹或图片后，将开始处理（本界面不展示图片预览）。"
-            "拍照建议：尽量正向、文字横平竖直，避免倒置与大角度倾斜；"
-            "同一套题尽量保持题号清晰连续，避免多个题目出现重复题号。"
-        ),
-        foreground="#666",
-        font=_font_small,
-        wraplength=780,
-    )
+    lbl_thumb_note = ttk.Label(fr_top, text="选择含图文件夹后点击「开始」。", foreground="#666", wraplength=780)
     lbl_thumb_note.pack(anchor=tk.W, pady=(2, 0))
+
     chk_folder_batch = ttk.Checkbutton(
         fr_top,
-        text="按文件夹分层分批（每个「当前层有直属图片」的文件夹单独一轮，仅处理该层文件；子文件夹另算）",
+        text="按文件夹分层分批（每个「当前层有直属图片」的文件夹单独一轮）",
         variable=folder_batch_var,
     )
     chk_folder_batch.pack(anchor=tk.W, pady=(4, 0))
 
-    def _refresh_folder_or_temp_label() -> None:
+    fr_mode = ttk.LabelFrame(fr_top, text="处理分支", padding=4)
+    fr_mode.pack(fill=tk.X, pady=(6, 0))
+    ttk.Radiobutton(
+        fr_mode,
+        text="教师讲解：逐图 VLM → 按页码拼接 → LLM 拆题 → 生成讲课 Word",
+        variable=pipeline_mode_var,
+        value="lecture",
+    ).pack(anchor=tk.W)
+    ttk.Radiobutton(
+        fr_mode,
+        text="题目修正：相同 scan+拆题流程 → 教材向修正（无卷面解析时 LLM 生成解析）→ 导出 xlsx",
+        variable=pipeline_mode_var,
+        value="correction",
+    ).pack(anchor=tk.W, pady=(2, 0))
+
+    def _refresh_input_label() -> None:
         wd = work_dir[0]
         if not wd or not wd.is_dir():
-            return
-        if is_temp[0]:
-            img_paths = _list_images(wd)
-            lbl_in.config(
-                text=(
-                    f"已选多文件  （临时: {wd}，结束后自动删除，"
-                    f"共 {len(img_paths)} 张有效图）"
-                ),
-                foreground="black",
-            )
-            if not img_paths:
-                lbl_thumb_note.config(text="该路径下无支持的图片格式。", foreground="#a60")
-            else:
-                lbl_thumb_note.config(text=f"已选择 {len(img_paths)} 张图片，点击「开始」处理。", foreground="#444")
             return
         if folder_batch_var.get():
             batches = _dirs_with_direct_images_dfs(wd)
             nic = sum(len(_list_direct_images_in_dir(b)) for b in batches)
-            lbl_in.config(
-                text=f"文件夹: {wd}  （分层分批：{len(batches)} 个文件夹层，共 {nic} 张直属图）",
-                foreground="black",
-            )
-            if not batches:
-                lbl_thumb_note.config(
-                    text=(
-                        "分批模式：整棵树里没有任何文件夹在其「当前层」放置图片。"
-                        "请把图片放在要识别的目录层上，或取消勾选分批以递归处理。"
-                    ),
-                    foreground="#a60",
-                )
-            else:
-                lbl_thumb_note.config(
-                    text=(
-                        f"将按深度优先依次处理 {len(batches)} 个文件夹层（每层仅该层直属图片）；"
-                        f"输出在本次任务目录下的 001_根名-子路径（如 001_1-3-3）、002_… 子文件夹。"
-                    ),
-                    foreground="#444",
-                )
+            lbl_in.config(text=f"文件夹: {wd}  （分批 {len(batches)} 层，{nic} 张直属图）", foreground="black")
         else:
-            img_paths = _list_images(wd)
-            nic = len(img_paths)
-            lbl_in.config(text=f"文件夹: {wd}  （共 {nic} 张图）", foreground="black")
-            if not img_paths:
-                lbl_thumb_note.config(text="该路径下无支持的图片格式。", foreground="#a60")
-            else:
-                lbl_thumb_note.config(text=f"已选择 {nic} 张图片，点击「开始」处理。", foreground="#444")
+            n = len(_list_images(wd))
+            lbl_in.config(text=f"文件夹: {wd}  （共 {n} 张）", foreground="black")
 
-    folder_batch_var.trace_add("write", lambda *_: _refresh_folder_or_temp_label())
-
-    def _clear_input_preview() -> None:
-        lbl_thumb_note.config(
-            text=(
-                "选择含图的文件夹或图片后，将开始处理（本界面不展示图片预览）。"
-                "拍照建议：尽量正向、文字横平竖直，避免倒置与大角度倾斜；"
-                "同一套题尽量保持题号清晰连续，避免多个题目出现重复题号。"
-            ),
-            foreground="#666",
-        )
+    folder_batch_var.trace_add("write", lambda *_: _refresh_input_label())
 
     def on_pick_dir() -> None:
         p = filedialog.askdirectory(title="选择含图片的文件夹", mustexist=True)
         if not p:
             return
-        d = Path(p)
-        work_dir[0] = d
-        is_temp[0] = False
-        chk_folder_batch["state"] = tk.NORMAL
-        _refresh_folder_or_temp_label()
-        if not folder_batch_var.get():
-            if not _list_images(d):
-                messagebox.showwarning("提示", "该目录下没有支持的图片（.png / .jpg / .jpeg / .bmp / .webp）。")
-
-    def on_pick_files() -> None:
-        files = filedialog.askopenfilenames(
-            title="选择一个或多个图片",
-            filetypes=[
-                ("图片", "*.png;*.jpg;*.jpeg;*.bmp;*.webp"),
-                ("全部", "*.*"),
-            ],
-        )
-        if not files:
-            return
-        chk_folder_batch["state"] = tk.DISABLED
-        folder_batch_var.set(False)
-        paths = [Path(f) for f in files if Path(f).is_file()]
-        if not paths:
-            return
-        tmp = Path(tempfile.mkdtemp(prefix="mm_qbank_gui_"))
-        for src in paths:
-            shutil.copy2(src, tmp / src.name)
-        work_dir[0] = tmp
-        is_temp[0] = True
-        img_paths = _list_images(tmp)
-        lbl_in.config(
-            text=(
-                f"已选 {len(paths)} 个文件  （临时: {tmp}，结束后自动删除，"
-                f"共 {len(img_paths)} 张有效图）"
-            ),
-            foreground="black",
-        )
-        if not img_paths:
-            lbl_thumb_note.config(text="该路径下无支持的图片格式。", foreground="#a60")
-        else:
-            lbl_thumb_note.config(text=f"已选择 {len(img_paths)} 张图片，点击「开始」处理。", foreground="#444")
-        if not img_paths:
-            messagebox.showwarning("提示", "未复制到有效图片，请重选。")
+        work_dir[0] = Path(p)
+        _refresh_input_label()
+        if not folder_batch_var.get() and not _list_images(Path(p)):
+            messagebox.showwarning("提示", "该目录下没有支持的图片。")
 
     btn_dir["command"] = on_pick_dir
-    btn_files["command"] = on_pick_files
 
-    # 输出说明
     fr_out = ttk.LabelFrame(content, text="输出位置", padding=6)
     fr_out.pack(fill=tk.X, padx=8, pady=4)
-    ex = (project_root() / "data" / "out" / "vlm_gui_YYYYMMDD_hhmmss_输入文件夹名").as_posix()
-    lbl_path = ttk.Label(fr_out, text=f"开始转写时生成时间戳，目录形如: {ex}", wraplength=800)
+    lbl_path = ttk.Label(
+        fr_out,
+        text="开始后在 data/out/ 下生成时间戳目录",
+        wraplength=800,
+    )
     lbl_path.pack(anchor=tk.W)
 
-    # 进度
     fr_pb = ttk.LabelFrame(content, text="进度", padding=6)
     fr_pb.pack(fill=tk.X, padx=8, pady=2)
-    pb = ttk.Progressbar(fr_pb, mode="determinate", length=780, maximum=1000, value=0)
+    pb = ttk.Progressbar(fr_pb, mode="determinate", maximum=1000, value=0)
     pb.pack(fill=tk.X, pady=(0, 4))
     st_lbl = ttk.Label(fr_pb, text="空闲")
     st_lbl.pack(anchor=tk.W)
-    fr_pb_btns = ttk.Frame(fr_pb)
-    fr_pb_btns.pack(fill=tk.X, pady=2)
-    btn_ref = ttk.Button(fr_pb_btns, text="打开输出目录", state=tk.DISABLED, width=18)
-    btn_ref.pack(side=tk.LEFT)
+    btn_ref = ttk.Button(fr_pb, text="打开输出目录", state=tk.DISABLED)
+    btn_ref.pack(anchor=tk.W, pady=4)
 
-    # 日志
+    fr_ops = ttk.LabelFrame(content, text="转写控制", padding=6)
+    fr_ops.pack(fill=tk.X, padx=8, pady=4)
+    fr_ops_btns = ttk.Frame(fr_ops)
+    fr_ops_btns.pack(fill=tk.X)
+    btn_s = ttk.Button(fr_ops_btns, text="开始", width=10)
+    btn_s.pack(side=tk.LEFT, padx=(0, 6))
+    btn_pause = ttk.Button(fr_ops_btns, text="暂停", width=10, state=tk.DISABLED)
+    btn_pause.pack(side=tk.LEFT, padx=6)
+    btn_end = ttk.Button(fr_ops_btns, text="结束", width=10, state=tk.DISABLED)
+    btn_end.pack(side=tk.LEFT, padx=6)
+
+    fr_llm = ttk.Frame(fr_ops)
+    fr_llm.pack(fill=tk.X, pady=(6, 0))
+    ttk.Label(fr_llm, text="LLM 参数：").pack(side=tk.LEFT)
+    try:
+        _cfg0 = load_config(None)
+    except Exception:
+        _cfg0 = {}
+    _rcfg0 = dict((_cfg0.get("refine") or {}) if isinstance(_cfg0, dict) else {})
+    _lcc0 = dict((_cfg0.get("lecture_content") or {}) if isinstance(_cfg0, dict) else {})
+    _web0 = bool(_rcfg0.get("web_search", False)) or bool(_lcc0.get("web_search", False))
+    web_search_var = tk.BooleanVar(value=_web0)
+    ttk.Checkbutton(fr_llm, text="联网检索", variable=web_search_var).pack(side=tk.LEFT, padx=(6, 0))
+    _gui_yaml = (project_root() / "configs" / "default.yaml").resolve()
+
+    def _persist_web_search() -> None:
+        try:
+            cfg = load_config(None)
+        except Exception:
+            cfg = deepcopy(_cfg0) if isinstance(_cfg0, dict) else {}
+        if not isinstance(cfg, dict):
+            cfg = {}
+        ws = bool(web_search_var.get())
+        rcfg = dict(cfg.get("refine") or {})
+        lccfg = dict(cfg.get("lecture_content") or {})
+        rcfg["web_search"] = ws
+        lccfg["web_search"] = ws
+        cfg["refine"] = rcfg
+        cfg["lecture_content"] = lccfg
+        text = yaml.safe_dump(cfg, allow_unicode=True, sort_keys=False)
+        tmp = _gui_yaml.with_suffix(_gui_yaml.suffix + ".tmp")
+        tmp.write_text(text, encoding="utf-8")
+        tmp.replace(_gui_yaml)
+
+    web_search_var.trace_add("write", lambda *_: _persist_web_search())
+    gui_llm_persist_cb.append(_persist_web_search)
+
     fr_log = ttk.LabelFrame(content, text="日志", padding=4)
     fr_log.pack(fill=tk.BOTH, expand=True, padx=8, pady=4)
     fr_log_bar = ttk.Frame(fr_log)
     fr_log_bar.pack(fill=tk.X, pady=(0, 4))
-    # 主题切换
     ttk.Label(fr_log_bar, text="主题：").pack(side=tk.LEFT)
-    style = ttk.Style()
     builtin_themes = list(style.theme_names() or [])
     theme_var = tk.StringVar(value="sv-light" if sv_ttk is not None else (builtin_themes[0] if builtin_themes else ""))
     theme_values: list[str] = []
@@ -551,24 +474,23 @@ def main() -> None:
     _apply_theme()
 
     ttk.Label(fr_log_bar, text="日志级别：").pack(side=tk.LEFT)
-    log_level_var = tk.StringVar(value="INFO")
+    log_level_var = tk.StringVar(value="info")
     cb_level = ttk.Combobox(
         fr_log_bar,
         textvariable=log_level_var,
-        values=["INFO", "DEBUG", "WARNING"],
+        values=["info", "debug", "warning"],
         width=10,
         state="readonly",
     )
     cb_level.pack(side=tk.LEFT)
 
     def _apply_log_level(_: Any | None = None) -> None:
-        v = (log_level_var.get() or "INFO").strip().upper()
+        v = (log_level_var.get() or "info").strip().lower()
         level = logging.INFO
-        if v == "DEBUG":
+        if v == "debug":
             level = logging.DEBUG
-        elif v in ("WARN", "WARNING"):
+        elif v in ("warn", "warning"):
             level = logging.WARNING
-        # 根 logger + GUI handler 同步；第三方库仍保持 WARNING 避免刷屏
         logging.getLogger().setLevel(level)
         th.setLevel(level)
         logging.getLogger("mm_qbank").setLevel(level)
@@ -576,24 +498,25 @@ def main() -> None:
     cb_level.bind("<<ComboboxSelected>>", _apply_log_level)
     _apply_log_level()
 
-    font_ = _font_mono or (("Consolas", 11) if os.name == "nt" else ("monospace", 11))
-    log_t = scrolledtext.ScrolledText(fr_log, height=16, state=tk.DISABLED, font=font_)
+    log_t = scrolledtext.ScrolledText(
+        fr_log,
+        height=14,
+        state=tk.DISABLED,
+        font=_font_mono or _font_main or ("Consolas", 10),
+    )
 
     def _append_t(msg: str) -> None:
         log_t.config(state=tk.NORMAL)
-        log_t.insert(tk.END, msg)
-        if not msg.endswith("\n"):
-            log_t.insert(tk.END, "\n")
+        log_t.insert(tk.END, msg if msg.endswith("\n") else msg + "\n")
         log_t.see(tk.END)
         log_t.config(state=tk.DISABLED)
 
     log_t.pack(fill=tk.BOTH, expand=True)
-    _append_t("将 mm-qbank 的日志显示在此处；请在项目根 .env 中配置 VLM_* / LLM_* 后启动本程序（或改 configs/default.yaml）。\n\n")
+    _append_t(_env_startup_hint())
 
     def poll_q() -> None:
         if _LOG_QUEUE is None:
             return
-        # 重要：限制每次 UI tick 处理的日志条数，避免日志刷屏时阻塞主线程导致“界面未响应”。
         buf: list[str] = []
         for _ in range(200):
             try:
@@ -606,755 +529,229 @@ def main() -> None:
 
     root.after(150, poll_q)
 
-    # --- 开始 / 打开
-    def on_open() -> None:
-        p = last_out[0]
-        if p and p.is_dir():
-            try:
-                _reveal_dir(p)
-            except Exception as e:  # noqa: BLE001
-                messagebox.showerror("无法打开", str(e))
-        else:
-            messagebox.showinfo("提示", "尚无可打开的目录。请先成功完成一次转写。")
-
-    btn_ref["command"] = on_open
-
-    def _set_input_buttons(state: str) -> None:
+    def _set_input_state(state: str) -> None:
         btn_dir["state"] = state
-        btn_files["state"] = state
         chk_folder_batch["state"] = state
 
-    def _reset_to_initial(*, keep_last_out: bool = True) -> None:
-        """一次任务结束后回到初始可运行状态（保留日志；可选择保留 last_out 以便打开目录）。"""
-        # 清空输入选择
+    def _reset_ui(*, keep_out: bool = True) -> None:
         work_dir[0] = None
-        is_temp[0] = False
-        _clear_input_preview()
         lbl_in.config(text="未选择", foreground="#666")
         chk_folder_batch["state"] = tk.NORMAL
-        # 进度与状态
         pb["value"] = 0
         st_lbl.config(text="空闲", foreground="black")
         root.config(cursor="")
-        # “打开输出目录”是否可用
-        if keep_last_out and last_out[0] and Path(str(last_out[0])).is_dir():
-            btn_ref["state"] = tk.NORMAL
-        else:
+        if not (keep_out and last_out[0] and Path(str(last_out[0])).is_dir()):
             last_out[0] = None
             btn_ref["state"] = tk.DISABLED
 
-    def _set_run_buttons(*, working: bool, paused: bool) -> None:
+    def _set_run_btns(working: bool, paused: bool) -> None:
         is_running[0] = working
-        if not working:
-            btn_s["state"] = tk.NORMAL
-            btn_pause["state"] = tk.DISABLED
-            btn_pause["text"] = "暂停"
-            user_paused[0] = False
-            btn_end["state"] = tk.DISABLED
-        else:
-            btn_s["state"] = tk.DISABLED
-            btn_pause["state"] = tk.NORMAL
-            btn_pause["text"] = "继续" if paused else "暂停"
-            btn_end["state"] = tk.NORMAL
+        btn_s["state"] = tk.DISABLED if working else tk.NORMAL
+        btn_pause["state"] = tk.NORMAL if working else tk.DISABLED
+        btn_pause["text"] = "继续" if paused else "暂停"
+        btn_end["state"] = tk.NORMAL if working else tk.DISABLED
+
+    batch_prog = {"idx": 0, "n": 1}
 
     def on_run() -> None:
         if is_running[0]:
             return
         wd = work_dir[0]
-        folder_batches_op: list[Path] | None = None
         if not wd or not wd.is_dir():
-            messagebox.showwarning("提示", "请先通过「选择图片文件夹」或「选择图片（可多选）」添加输入。")
+            messagebox.showwarning("提示", "请先选择图片文件夹。")
             return
-        if is_temp[0] and folder_batch_var.get():
-            messagebox.showwarning(
-                "提示",
-                "多选图片产生的临时目录不支持「按文件夹分层分批」，请取消勾选后重试。",
-            )
-            return
-        if bool(folder_batch_var.get()) and not is_temp[0]:
-            fb = _dirs_with_direct_images_dfs(wd)
-            if not fb:
-                messagebox.showwarning(
-                    "提示",
-                    "分批模式：没有任何文件夹在其当前层含有直属图片。\n"
-                    "请把图片放在对应目录层上，或取消勾选分批以递归处理整棵树。",
-                )
+        mode = pipeline_mode_var.get()
+        folder_batches: list[Path] | None = None
+        if folder_batch_var.get():
+            folder_batches = _dirs_with_direct_images_dfs(wd)
+            if not folder_batches:
+                messagebox.showwarning("提示", "分批模式：没有含直属图片的文件夹层。")
                 return
-            folder_batches_op = fb
-            n = sum(len(_list_direct_images_in_dir(b)) for b in folder_batches_op)
+            n = sum(len(_list_direct_images_in_dir(b)) for b in folder_batches)
         else:
-            folder_batches_op = None
             n = len(_list_images(wd))
             if n < 1:
-                messagebox.showwarning("提示", "当前输入路径下没有可处理的图片。")
+                messagebox.showwarning("提示", "文件夹内没有可处理的图片。")
                 return
-        was_temp = is_temp[0]
         run_cancel.clear()
         user_paused[0] = False
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        src_name = "input"
-        if wd.name:
-            src_name = _safe_name(wd.name)
-        out = project_root() / "data" / "out" / f"vlm_gui_{ts}_{src_name}"
+        src_name = _safe_name(wd.name) if wd.name else "input"
+        prefix = "lecture_gui" if mode == "lecture" else "correction_gui"
+        out = project_root() / "data" / "out" / f"{prefix}_{ts}_{src_name}"
         out.mkdir(parents=True, exist_ok=True)
         last_out[0] = out
         lbl_path.config(text=f"本次输出: {out.resolve()}", foreground="black")
-
-        export_tag = src_name
-        out_jsonl_path = out / f"refined_merged_{export_tag}.jsonl"
-        out_csv_path = out / f"refined_merged_stream_{export_tag}.csv"
-        out_xlsx_path = out / f"refined_merged_{export_tag}.xlsx"
-
-        fb_note = ""
-        if folder_batches_op:
-            fb_note = f"分层分批 {len(folder_batches_op)} 轮 · "
-        if bool(stream_refine_var.get()):
-            st_lbl.config(
-                text=(
-                    f"{fb_note}合计 {n} 张 · 0%（流式：VLM 多图并行 + 流式落盘；"
-                    f"按题号凑齐后触发教材向修正并流式写 CSV；页与页之间可暂停/结束）"
-                )
-            )
-        else:
-            st_lbl.config(
-                text=(
-                    f"{fb_note}合计 {n} 张 · 0%（顺序：VLM 全部完成后再开始教材向修正；"
-                    f"页与页之间可暂停/结束，单页请求中需等待返回）"
-                )
-            )
-        _set_input_buttons(tk.DISABLED)
-        _set_run_buttons(working=True, paused=False)
+        mode_label = "教师讲解" if mode == "lecture" else "题目修正"
+        st_lbl.config(text=f"合计 {n} 张 · 0%（{mode_label}）")
+        _set_input_state(tk.DISABLED)
+        _set_run_btns(True, False)
         btn_ref["state"] = tk.DISABLED
         root.config(cursor="wait")
-        root.after(0, lambda: pb.config(mode="determinate", maximum=1000, value=0))
+        pb["value"] = 0
 
-        def scale_prog(local_0_1000: int, bi: int, nbt: int) -> int:
+        def scale_prog(v: int, bi: int, nbt: int) -> int:
             if nbt <= 1:
-                return max(0, min(1000, local_0_1000))
+                return max(0, min(1000, v))
             span = 1000.0 / nbt
-            base = bi * span
-            return min(1000, int(base + max(0, min(1000, local_0_1000)) / 1000.0 * span))
-
-        def batch_prefix(bi: int, nbt: int) -> str:
-            return f"分批 {bi + 1}/{nbt} · " if nbt > 1 else ""
-
-        batch_prog = {"idx": 0, "n": 1}
+            return min(1000, int(bi * span + v / 1000.0 * span))
 
         def paused_fn() -> bool:
             return user_paused[0]
 
-        def on_vlm_page(i: int, t: int) -> None:
-            if t <= 0:
-                return
-            # 进度：VLM 占 50%
-            v = int(500 * i / t)
-            bi = int(batch_prog["idx"])
-            nbt = int(batch_prog["n"])
+        def on_vlm(done: int, total: int) -> None:
+            v = int(400 * done / max(1, total))
+            bi, nbt = batch_prog["idx"], batch_prog["n"]
 
             def u() -> None:
                 pb["value"] = scale_prog(v, bi, nbt)
-                p = 100.0 * i / t
-                pf = batch_prefix(bi, nbt)
-                if bool(stream_refine_var.get()):
-                    st_lbl.config(text=f"{pf}VLM {i}/{t} · {p:.1f}%（流式：凑题缓存→教材向修正进行中…）")
-                else:
-                    st_lbl.config(text=f"{pf}VLM {i}/{t} · {p:.1f}%（顺序：VLM 完成后才开始教材向修正…）")
+                st_lbl.config(text=f"VLM {done}/{total} · {100 * done // max(1, total)}%")
 
             root.after(0, u)
 
-        def on_refine_progress(n_done: int, n_total: int) -> None:
-            # 进度：LLM(修正) 占 50%
-            if n_total <= 0:
-                v = 500
-            else:
-                v = 500 + int(500 * min(max(n_done, 0), n_total) / max(1, n_total))
-            bi = int(batch_prog["idx"])
-            nbt = int(batch_prog["n"])
+        def on_final(done: int, total: int) -> None:
+            v = 400 + int(600 * done / max(1, total))
+            bi, nbt = batch_prog["idx"], batch_prog["n"]
+            label = "讲课" if mode == "lecture" else "修正"
 
             def u() -> None:
                 pb["value"] = scale_prog(v, bi, nbt)
-                # 状态补充：让用户能直观看到 LLM 修正进度在走
-                pf = batch_prefix(bi, nbt)
-                if n_total > 0:
-                    st_lbl.config(
-                        text=(
-                            f"{pf}教材向修正 {n_done}/{n_total} · "
-                            f"{50.0 + 50.0 * min(max(n_done, 0), n_total) / max(1, n_total):.1f}%"
-                        )
-                    )
-
-            root.after(0, u)
-
-        def on_lecture_content_progress(n_done: int, n_total: int) -> None:
-            if n_total <= 0:
-                v = 1000
-            else:
-                v = 500 + int(500 * min(max(n_done, 0), n_total) / max(1, n_total))
-            bi = int(batch_prog["idx"])
-            nbt = int(batch_prog["n"])
-
-            def u() -> None:
-                pb["value"] = scale_prog(v, bi, nbt)
-                pf = batch_prefix(bi, nbt)
-                if n_total > 0:
-                    st_lbl.config(
-                        text=(
-                            f"{pf}讲课内容 {n_done}/{n_total} · "
-                            f"{50.0 + 50.0 * min(max(n_done, 0), n_total) / max(1, n_total):.1f}%"
-                        )
-                    )
-
-            root.after(0, u)
-
-        def on_llm_page(j: int, t: int) -> None:
-            if t <= 0:
-                return
-            v = 500 + int(500 * j / t)
-            bi = int(batch_prog["idx"])
-            nbt = int(batch_prog["n"])
-
-            def u() -> None:
-                pb["value"] = scale_prog(v, bi, nbt)
-                p = 50.0 + 50.0 * j / t
-                pf = batch_prefix(bi, nbt)
-                st_lbl.config(
-                    text=f"{pf}拆题 {j}/{t} · {p:.1f}%（离线提取 composed_items，不额外调用模型）"
-                )
-
-            root.after(0, u)
-
-        refined_n: list[int] = [0]
-
-        def on_refine_item_done(n_done: int) -> None:
-            refined_n[0] = int(n_done)
-
-            def u() -> None:
-                # 不改变进度条（由 VLM 页控制），只更新状态文字展示已修正题数
-                if "text" in st_lbl.keys():
-                    cur = st_lbl.cget("text")
-                else:
-                    cur = ""
-                if cur:
-                    st_lbl.config(text=f"{cur} · 已修正 {refined_n[0]} 题")
-                else:
-                    st_lbl.config(text=f"已修正 {refined_n[0]} 题")
+                st_lbl.config(text=f"{label} {done}/{total}")
 
             root.after(0, u)
 
         def work() -> None:
             err: str | None = None
-            vlm: dict[str, Any] = {}
-            image_job_sm: dict[str, Any] | None = None
+            sm_acc: dict[str, Any] = {}
             try:
                 if gui_llm_persist_cb:
                     gui_llm_persist_cb[0]()
                 assert wd is not None
-                batches_loop: list[tuple[Path, Path]]
-                if folder_batches_op:
-                    batches_loop = [
-                        (b, out / f"{i + 1:03d}_{_batch_output_slug(b, wd)}")
-                        for i, b in enumerate(folder_batches_op)
-                    ]
+                if folder_batches:
+                    loops = [(b, out / f"{i + 1:03d}_{_batch_output_slug(b, wd)}") for i, b in enumerate(folder_batches)]
                 else:
-                    batches_loop = [(wd, out)]
-                batch_prog["n"] = len(batches_loop)
-
-                folder_summaries: list[dict[str, Any]] = []
-
-                def _run_one_folder_batch(
-                    batch_wd: Path,
-                    batch_out: Path,
-                    oj: Path,
-                    oc: Path,
-                    ox: Path,
-                ) -> tuple[str | None, dict[str, Any]]:
-                    err_b: str | None = None
-                    vlm_b: dict[str, Any] = {}
-                    try:
-                        if bool(stream_refine_var.get()):
-                            root.after(
-                                0,
-                                lambda: st_lbl.config(text="流式：VLM →（凑题缓存）→ 教材向修正（LLM）…"),
-                            )
-                            s = run_vlm_text_and_refine_streaming(
-                                input_dir=batch_wd,
-                                out_dir=batch_out,
-                                config_path=None,
-                                vlm_model=None,
-                                refine_model=None,
-                                out_jsonl=oj,
-                                out_csv=oc,
-                                out_xlsx=ox,
-                                cancel_event=run_cancel,
-                                paused=paused_fn,
-                                on_vlm_page_done=on_vlm_page,
-                                on_refine_item_done=on_refine_item_done,
-                                on_refine_progress=on_refine_progress,
-                                on_lecture_content_progress=on_lecture_content_progress,
-                            )
-                            rf = {
-                                "n_rows": s.get("n_rows", 0),
-                                "out_jsonl": s.get("out_jsonl", ""),
-                                "out_csv": s.get("out_csv", ""),
-                                "out_xlsx": s.get("out_xlsx", ""),
-                                "model": s.get("refine_model", ""),
-                                "web_search": s.get("web_search", False),
-                            }
-                            vlm_b = {
-                                k: v
-                                for k, v in s.items()
-                                if k
-                                not in ("n_rows", "out_jsonl", "out_csv", "out_xlsx", "refine_model")
-                            }
-                            vlm_b["refine"] = rf
-                        else:
-                            vlm_b = run_vlm_text_only(
-                                input_dir=batch_wd,
-                                out_dir=batch_out,
-                                config_path=None,
-                                model=None,
-                                cancel_event=run_cancel,
-                                paused=paused_fn,
-                                on_page_done=on_vlm_page,
-                            )
-                            mp_b = vlm_b.get("manifest")
-                            ok_mb = (
-                                bool(mp_b)
-                                and Path(str(mp_b)).is_file()
-                                and any(
-                                    L.strip()
-                                    for L in Path(str(mp_b)).read_text(encoding="utf-8").splitlines()
-                                )
-                            )
-                            if ok_mb and not vlm_b.get("cancelled", False):
-                                root.after(
-                                    0,
-                                    lambda: st_lbl.config(
-                                        text="VLM 已完成，开始教材向修正（等待全部 VLM 后再给 LLM）…"
-                                    ),
-                                )
-                                rf = run_refine_vlm_merged(
-                                    manifest_path=Path(str(mp_b)),
-                                    out_jsonl=oj,
-                                    out_csv=oc,
-                                    out_xlsx=ox,
-                                    config_path=None,
-                                    model=None,
-                                    on_refine_progress=on_refine_progress,
-                                    on_lecture_content_progress=on_lecture_content_progress,
-                                )
-                                vlm_b = {**vlm_b, "refine": rf}
-                    except Exception as ex_b:  # noqa: BLE001
-                        err_b = str(ex_b)
-                        vlm_b = {}
-                    return err_b, vlm_b
-
-                def _compose_sm_for_batch(
-                    vlm_in: dict[str, Any],
-                    comp_out: Path,
-                ) -> dict[str, Any]:
-                    sm_local = {
-                        **vlm_in,
-                        "llm_compose": None,
-                        "refine": (
-                            vlm_in.get("refine") if isinstance(vlm_in.get("refine"), dict) else None
-                        ),
-                        "compose_error": None,
-                    }
-                    mp_c = vlm_in.get("manifest")
-                    ok_mc = (
-                        bool(mp_c)
-                        and Path(str(mp_c)).is_file()
-                        and any(
-                            L.strip() for L in Path(str(mp_c)).read_text(encoding="utf-8").splitlines()
-                        )
-                    )
-                    if ok_mc:
-                        try:
-                            sm_local["llm_compose"] = run_llm_compose_manifest(
-                                manifest_path=Path(str(mp_c)),
-                                out_jsonl=comp_out,
-                                config_path=None,
-                                model=None,
-                                cancel_event=run_cancel,
-                                paused=paused_fn,
-                                on_page_done=on_llm_page,
-                            )
-                        except Exception as e2:  # noqa: BLE001
-                            sm_local["compose_error"] = str(e2)
-                            sm_local["llm_compose"] = None
-                        return sm_local
-
-                sm_acc: dict[str, Any] = {}
-                vlm = {}
-                for bi, (batch_src, batch_out) in enumerate(batches_loop):
+                    loops = [(wd, out)]
+                batch_prog["n"] = len(loops)
+                summaries: list[dict[str, Any]] = []
+                for bi, (batch_src, batch_out) in enumerate(loops):
                     batch_prog["idx"] = bi
-                    refined_n[0] = 0
                     while user_paused[0] and not run_cancel.is_set():
                         time.sleep(0.15)
                     if run_cancel.is_set():
-                        sm_acc = {
-                            "cancelled": True,
-                            "out_dir": str(out),
-                            "n_pages": 0,
-                            "n_total_images": 0,
-                            "llm_compose": None,
-                            "refine": None,
-                        }
-                        vlm = dict(sm_acc)
+                        sm_acc = {"cancelled": True, "mode": mode, "out_dir": str(out)}
                         break
                     batch_out.mkdir(parents=True, exist_ok=True)
-                    tag = (
-                        _batch_output_slug(batch_src, wd)
-                        if folder_batches_op
-                        else _safe_name(batch_src.name)
-                    )
-                    if folder_batches_op:
-                        oj = batch_out / f"refined_merged_{tag}.jsonl"
-                        oc = batch_out / f"refined_merged_stream_{tag}.csv"
-                        ox = batch_out / f"refined_merged_{tag}.xlsx"
-                        comp_out = batch_out / "llm_compose_merged.jsonl"
-                        staging = Path(tempfile.mkdtemp(prefix="mm_qbank_gui_batch_"))
-                        try:
-                            for img in _list_direct_images_in_dir(batch_src):
-                                shutil.copy2(img, staging / img.name)
-                            pipeline_in = staging
-                            err_b, vlm_batch = _run_one_folder_batch(
-                                pipeline_in, batch_out, oj, oc, ox
+                    pipeline_in = batch_src
+                    staging: Path | None = None
+                    if folder_batches:
+                        staging = Path(tempfile.mkdtemp(prefix="mm_qbank_batch_"))
+                        for img in _list_direct_images_in_dir(batch_src):
+                            shutil.copy2(img, staging / img.name)
+                        pipeline_in = staging
+                    try:
+                        if mode == "lecture":
+                            sm_b = run_lecture_scan_pipeline(
+                                input_dir=pipeline_in,
+                                out_dir=batch_out,
+                                config_path=None,
+                                cancel_event=run_cancel,
+                                paused=paused_fn,
+                                on_vlm_page_done=on_vlm,
+                                on_assemble_done=lambda: root.after(0, lambda: st_lbl.config(text="LLM 拆题与讲课内容…")),
+                                on_lecture_progress=on_final,
                             )
-                        finally:
+                        else:
+                            sm_b = run_correction_scan_pipeline(
+                                input_dir=pipeline_in,
+                                out_dir=batch_out,
+                                config_path=None,
+                                cancel_event=run_cancel,
+                                paused=paused_fn,
+                                on_vlm_page_done=on_vlm,
+                                on_assemble_done=lambda: root.after(0, lambda: st_lbl.config(text="LLM 拆题与教材修正…")),
+                                on_refine_progress=on_final,
+                            )
+                    finally:
+                        if staging:
                             shutil.rmtree(staging, ignore_errors=True)
-                    else:
-                        oj, oc, ox = out_jsonl_path, out_csv_path, out_xlsx_path
-                        comp_out = out / "llm_compose_merged.jsonl"
-                        err_b, vlm_batch = _run_one_folder_batch(batch_src, batch_out, oj, oc, ox)
-                    if err_b:
-                        err = err_b
-                        vlm = {}
-                        sm_acc = {}
+                    if sm_b.get("cancelled"):
+                        sm_acc = {**sm_b, "mode": mode, "out_dir": str(out)}
                         break
-                    if vlm_batch.get("cancelled", False):
-                        sm_acc = {**vlm_batch, "llm_compose": None, "refine": None}
-                        vlm = vlm_batch
-                        break
-                    sm_acc = _compose_sm_for_batch(vlm_batch, comp_out)
-                    vlm = sm_acc
-                    rf_sm = sm_acc.get("refine")
-                    ox_sm = rf_sm.get("out_xlsx", "") if isinstance(rf_sm, dict) else ""
-                    folder_summaries.append(
+                    sm_acc = {**sm_b, "mode": mode, "out_dir": str(out)}
+                    summaries.append(
                         {
-                            "name": _folder_batch_display_name(batch_src, wd)
-                            if folder_batches_op
-                            else batch_src.name,
+                            "name": _folder_batch_display_name(batch_src, wd) if folder_batches else batch_src.name,
                             "out_sub": str(batch_out),
-                            "xlsx": ox_sm,
+                            "docx": sm_b.get("out_docx", ""),
+                            "xlsx": sm_b.get("out_xlsx") or (sm_b.get("refine") or {}).get("out_xlsx", ""),
+                            "n_questions": sm_b.get("n_questions", 0),
                         }
                     )
-                else:
-                    sm_acc["out_dir"] = str(out)
-                    if folder_batches_op and len(batches_loop) > 1:
-                        sm_acc["mode"] = "folder_batches"
-                        sm_acc["folder_batch_count"] = len(batches_loop)
-                        sm_acc["folder_batch_summaries"] = folder_summaries
-                    vlm = sm_acc
-
-                image_job_sm = sm_acc
-            except Exception as e:  # noqa: BLE001
-                err = str(e)
-                vlm = {}
-
-            sm: dict[str, Any] = {}
-            sm = image_job_sm if image_job_sm is not None else {}
-            if err is None and vlm and not vlm.get("cancelled", False) and not sm:
-                # 备用：图片流水线未写入 sm 时，再用 manifest 跑拆题（正常已由分批/单批循环完成）
-                sm = {**vlm, "llm_compose": None, "refine": (vlm.get("refine") if isinstance(vlm.get("refine"), dict) else None), "compose_error": None}
-                mp = vlm.get("manifest")
-                ok_m = (
-                    bool(mp)
-                    and Path(mp).is_file()
-                    and any(L.strip() for L in Path(mp).read_text(encoding="utf-8").splitlines())
-                )
-                if ok_m:
-                    mpath = Path(mp)
-                    try:
-                        comp_out = out / "llm_compose_merged.jsonl"
-                        sm["llm_compose"] = run_llm_compose_manifest(
-                            manifest_path=mpath,
-                            out_jsonl=comp_out,
-                            config_path=None,
-                            model=None,
-                            cancel_event=run_cancel,
-                            paused=paused_fn,
-                            on_page_done=on_llm_page,
-                        )
-                    except Exception as e2:  # noqa: BLE001
-                        sm["compose_error"] = str(e2)
-                        sm["llm_compose"] = None
-                    # refine：顺序模式下可能已完成（vlm['refine']），否则不强行填充
-            elif vlm and not sm:
-                sm = {**vlm, "llm_compose": None, "refine": None}
-            if not sm and vlm:
-                sm = {**vlm, "llm_compose": None, "refine": None}
-
-            try:
-                if was_temp and wd and wd.is_dir():
-                    shutil.rmtree(wd, ignore_errors=True)
-                    is_temp[0] = False
-                    work_dir[0] = None
-
-                    def _after_temp_removed() -> None:
-                        _clear_input_preview()
-                        lbl_in.config(text="多选图片的临时目录已删；请重新选择输入", foreground="#666")
-
-                    root.after(0, _after_temp_removed)
-            except OSError:  # noqa: BLE001
-                pass
-
-            e_done = err
-            s_done = sm
-            root.after(0, lambda e=e_done, s=s_done: on_done(e, s))
+                if len(loops) > 1 and err is None and not sm_acc.get("cancelled"):
+                    sm_acc["folder_batch_summaries"] = summaries
+                    sm_acc["folder_batch_count"] = len(loops)
+            except Exception as ex:  # noqa: BLE001
+                err = str(ex)
+                sm_acc = {}
+            root.after(0, lambda e=err, s=sm_acc: on_done(e, s))
 
         def on_done(e: str | None, s: dict[str, Any]) -> None:
             root.config(cursor="")
             run_cancel.clear()
-            _set_input_buttons(tk.NORMAL)
-            _set_run_buttons(working=False, paused=False)
-            if e is not None:
+            _set_input_state(tk.NORMAL)
+            _set_run_btns(False, False)
+            if e:
                 pb["value"] = 0
                 st_lbl.config(text="失败", foreground="red")
                 _append_t(f"\n[错误] {e}\n")
-                messagebox.showerror("转写失败", e)
-                _reset_to_initial(keep_last_out=True)
+                messagebox.showerror("失败", e)
+                _reset_ui(keep_out=True)
                 return
-            if s.get("mode") == "folder_batches":
-                pb["value"] = 1000
-                od0 = s.get("out_dir") or str(out)
-                lp = Path(od0)
-                if lp.is_dir():
-                    last_out[0] = lp
-                st_lbl.config(text="完成（分批）", foreground="green")
-                btn_ref["state"] = tk.NORMAL
-                summaries = s.get("folder_batch_summaries") if isinstance(s.get("folder_batch_summaries"), list) else []
-                nb_ = s.get("folder_batch_count", len(summaries))
-                _append_t(f"\n==== 分批完成 ====  共 {nb_} 批  根目录: {od0}\n")
-                for it in summaries:
-                    if isinstance(it, dict):
-                        _append_t(f"· {it.get('name', '')}: {it.get('out_sub', '')}\n  xlsx: {it.get('xlsx', '')}\n")
-                lines_msg = [f"共完成 {nb_} 批，输出根目录:\n{od0}", ""]
-                for it in summaries:
-                    if isinstance(it, dict):
-                        lines_msg.append(f"· {it.get('name', '')}")
-                        if it.get("xlsx"):
-                            lines_msg.append(f"  {it.get('xlsx')}")
-                messagebox.showinfo("完成（分批）", "\n".join(lines_msg))
-                try:
-                    _reveal_dir(last_out[0] or lp)
-                except Exception as ex:  # noqa: BLE001
-                    _append_t(f"自动打开目录失败: {ex}\n")
-                _reset_to_initial(keep_last_out=True)
-                return
-            lc = s.get("llm_compose")
-            vlm_c = s.get("cancelled", False)
-            llm_c = bool((lc or {}).get("cancelled", False) if isinstance(lc, dict) else False)
-            if vlm_c or llm_c:
-                pb["value"] = 0
-                n_done = s.get("n_pages", 0)
-                n_tot = s.get("n_total_images", n_done)
-                phase = "LLM" if vlm_c is False and llm_c else "VLM/全程"
-                st_lbl.config(text="已结束（用户）", foreground="#a60")
-                mnf = s.get("manifest", "")
-                _append_t(
-                    f"\n==== 已结束/取消（{phase}）====  VLM: {n_done} / 共 {n_tot} 张\n清单: {mnf}\n"
-                )
-                if isinstance(lc, dict) and llm_c:
-                    _append_t(
-                        f"LLM 已写 {lc.get('n_written', 0)}/{lc.get('n_pages', 0)} 行 -> {lc.get('out_jsonl', '')}\n"
-                    )
-                messagebox.showinfo("已结束", f"已停止（{phase} 阶段可）。\n输出: {s.get('out_dir', out)}")
-                od = s.get("out_dir") or str(out)
-                last_path = Path(od)
-                if last_path.is_dir():
-                    last_out[0] = last_path
-                btn_ref["state"] = tk.NORMAL
-                try:
-                    _reveal_dir(last_path)
-                except Exception as ex:  # noqa: BLE001
-                    _append_t(f"自动打开目录失败: {ex}\n")
-                _reset_to_initial(keep_last_out=True)
+            if s.get("cancelled"):
+                st_lbl.config(text="已结束", foreground="#a60")
+                messagebox.showinfo("已结束", f"输出: {s.get('out_dir', out)}")
+                _reset_ui(keep_out=True)
                 return
             pb["value"] = 1000
-            od = s.get("out_dir") or str(out)
-            last_path = Path(od)
-            if last_path.is_dir():
-                last_out[0] = last_path
-            st_lbl.config(text="完成", foreground="green")
+            od = str(s.get("out_dir") or out)
+            last_out[0] = Path(od)
             btn_ref["state"] = tk.NORMAL
-            npg = s.get("n_pages", "")
-            mnf = s.get("manifest", "")
-            _append_t(f"\n==== 完成 ====  VLM 页数: {npg}\nVLM 清单: {mnf}\n")
-            if isinstance(lc, dict) and lc.get("out_jsonl"):
-                _append_t(f"LLM 拆题: {lc.get('out_jsonl')}\n")
-            rf = s.get("refine")
-            if isinstance(rf, dict) and rf.get("out_xlsx") and not rf.get("error"):
-                _append_t(f"修正 + xlsx: {rf.get('out_xlsx')}\n")
-                if rf.get("out_csv"):
-                    _append_t(f"修正（流式 CSV）: {rf.get('out_csv')}\n")
-                lcx = rf.get("lecture_content")
-                if isinstance(lcx, dict) and lcx.get("out_docx"):
-                    _append_t(f"讲课内容 Word: {lcx.get('out_docx')}\n")
-            elif isinstance(rf, dict) and rf.get("error"):
-                _append_t(f"[修正/xlsx 未生成] {rf.get('error')}\n")
-            ce = s.get("compose_error")
-            if ce:
-                _append_t(f"[LLM 拆题失败] {ce}\n")
-            dmsg = f"已写入: {od}"
-            if isinstance(lc, dict) and (lc.get("out_jsonl")):
-                dmsg += f"\n\nLLM 拆题: {lc['out_jsonl']}"
+            mode = s.get("mode", "lecture")
+            if mode == "lecture":
+                st_lbl.config(text="完成（教师讲解）", foreground="green")
+                docx = s.get("out_docx") or ""
+                msg = f"拆题 {s.get('n_questions', 0)} 道\n讲义 Word:\n{docx or '（未生成）'}\n\n{od}"
             else:
-                dmsg += "\n\n（本任务未跑拆题或无可拆页）"
-            if isinstance(rf, dict) and rf.get("out_xlsx") and not rf.get("error"):
-                dmsg += f"\n\nxlsx: {rf['out_xlsx']}"
-                lcx2 = rf.get("lecture_content")
-                if isinstance(lcx2, dict) and lcx2.get("out_docx"):
-                    dmsg += f"\n\n讲义 Word: {lcx2['out_docx']}"
-            elif isinstance(rf, dict) and rf.get("error"):
-                dmsg += f"\n\n修正/xlsx 失败: {rf.get('error', '')}"
-            if ce:
-                dmsg += f"\n\n拆题失败（已跳过或部分跳过）: {ce}"
-            messagebox.showinfo("完成", f"{dmsg}\n\n将打开该文件夹。")
+                st_lbl.config(text="完成（题目修正）", foreground="green")
+                xlsx = s.get("out_xlsx") or (s.get("refine") or {}).get("out_xlsx", "")
+                msg = f"拆题 {s.get('n_questions', 0)} 道\n修正 xlsx:\n{xlsx or '（未生成）'}\n\n{od}"
+            _append_t(f"\n==== 完成 ====\n{msg}\n")
+            messagebox.showinfo("完成", msg)
             try:
-                _reveal_dir(last_out[0] or out)
+                _reveal_dir(Path(od))
             except Exception as ex:  # noqa: BLE001
-                _append_t(f"自动打开目录失败: {ex}\n")
-            _reset_to_initial(keep_last_out=True)
+                _append_t(f"打开目录失败: {ex}\n")
+            _reset_ui(keep_out=True)
 
         threading.Thread(target=work, daemon=True).start()
+
+    btn_s["command"] = on_run
+    btn_ref["command"] = lambda: _reveal_dir(last_out[0]) if last_out[0] else None
 
     def on_toggle_pause() -> None:
         if not is_running[0]:
             return
         user_paused[0] = not user_paused[0]
         btn_pause["text"] = "继续" if user_paused[0] else "暂停"
-        st_lbl.config(
-            text=("已暂停（下一整页开始前可点继续）" if user_paused[0] else "处理中（页间可暂停/结束）"),
-            foreground=("#a60" if user_paused[0] else "black"),
-        )
 
     def on_end() -> None:
-        if not is_running[0]:
-            return
-        run_cancel.set()
-        user_paused[0] = False
-        st_lbl.config(text="正在结束…（当前页若已请求网络则须等其返回）", foreground="#a60")
-        # 不立即改 暂停 文案，on_done 会整组重置
+        if is_running[0]:
+            run_cancel.set()
+            user_paused[0] = False
+            st_lbl.config(text="正在结束…", foreground="#a60")
 
-    # 不得放在主窗口最底部 + pack 在「可扩展的日志区」之后：在 Windows 上常会把底栏顶到视口外。
-    # 用「转写控制」带标题框，插在「输出位置」和「进度」之间，保证始终可见。
-    fr_ops = ttk.LabelFrame(content, text="转写控制", padding=6)
-    fr_ops.pack(fill=tk.X, padx=8, pady=4, before=fr_pb)
-    fr_ops_in = ttk.Frame(fr_ops)
-    fr_ops_in.pack(fill=tk.X)
-    btn_s = ttk.Button(fr_ops_in, text="开始", width=10, takefocus=1)
-    btn_s.pack(side=tk.LEFT, padx=(0, 6))
-    btn_pause = ttk.Button(fr_ops_in, text="暂停", width=10, state=tk.DISABLED, takefocus=1, command=on_toggle_pause)
-    btn_pause.pack(side=tk.LEFT, padx=6)
-    btn_end = ttk.Button(fr_ops_in, text="结束", width=10, state=tk.DISABLED, takefocus=1, command=on_end)
-    btn_end.pack(side=tk.LEFT, padx=6)
-    ttk.Separator(fr_ops_in, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=6, pady=2)
-    ttk.Label(
-        fr_ops_in,
-        text="VLM 整页转写 · 与模型单页请求进行中时须等其返回  ",
-    ).pack(side=tk.LEFT)
-    btn_s["command"] = on_run
-
-    # --- LLM 参数：教材向修正 + 结果表「讲师提醒」
-    fr_refine_flags = ttk.Frame(fr_ops)
-    fr_refine_flags.pack(fill=tk.X, pady=(6, 0))
-    ttk.Label(fr_refine_flags, text="LLM 参数：").pack(side=tk.LEFT)
-
-    # 读取默认配置作为初始值（GUI 允许覆盖；未覆盖时仍是默认行为）
-    _cfg0: dict[str, Any] = {}
-    try:
-        _cfg0 = load_config(None)
-    except Exception:
-        _cfg0 = {}
-    _rcfg0 = dict((_cfg0.get("refine") or {}) if isinstance(_cfg0, dict) else {})
-    _lcfg0 = dict((_cfg0.get("lecture_tips") or {}) if isinstance(_cfg0, dict) else {})
-    _stream0 = bool(_rcfg0.get("stream_refine", False))
-    # 联网：教材修正与讲师提醒共用一开关，初始为任一侧曾为 true 则为 true
-    _web0 = bool(_rcfg0.get("web_search", False)) or bool(_lcfg0.get("web_search", False))
-    _ltw0 = bool(_rcfg0.get("lecture_tips_with_refine", False))
-    _lca0 = bool(_rcfg0.get("lecture_content_after_refine", False))
-    stream_refine_var = tk.BooleanVar(value=_stream0)
-    web_search_var = tk.BooleanVar(value=_web0)
-    lecture_tips_with_refine_var = tk.BooleanVar(value=_ltw0)
-    lecture_content_after_refine_var = tk.BooleanVar(value=_lca0)
-
-    ttk.Checkbutton(fr_refine_flags, text="凑题缓存→流式修正", variable=stream_refine_var).pack(side=tk.LEFT, padx=(6, 0))
-    ttk.Checkbutton(
-        fr_refine_flags,
-        text="联网检索",
-        variable=web_search_var,
-    ).pack(side=tk.LEFT, padx=(12, 0))
-    ttk.Checkbutton(
-        fr_refine_flags,
-        text="修正时同批写「讲师提醒」（单次 LLM，与教材修正同一 JSON）",
-        variable=lecture_tips_with_refine_var,
-    ).pack(side=tk.LEFT, padx=(12, 0))
-    ttk.Checkbutton(
-        fr_refine_flags,
-        text="修正后生成「讲课内容」（要点+口播稿；另存 Word 讲义，每题单独请求）",
-        variable=lecture_content_after_refine_var,
-    ).pack(side=tk.LEFT, padx=(12, 0))
-
-    _gui_default_yaml = (project_root() / "configs" / "default.yaml").resolve()
-
-    def _persist_llm_flags_from_gui() -> None:
-        """
-        将当前 GUI 上 LLM 相关开关立即写入 ``configs/default.yaml``（保留其余键），
-        替代往输出目录写 ``_runtime_config.yaml``；流水线使用 ``config_path=None`` 即读该文件。
-        """
-        try:
-            cfg = load_config(None)
-        except Exception:
-            cfg = deepcopy(_cfg0) if isinstance(_cfg0, dict) else {}
-        if not isinstance(cfg, dict):
-            cfg = {}
-        rcfg = dict(cfg.get("refine") or {})
-        lcfg = dict(cfg.get("lecture_tips") or {})
-        lccfg = dict(cfg.get("lecture_content") or {})
-        ws = bool(web_search_var.get())
-        rcfg["stream_refine"] = bool(stream_refine_var.get())
-        rcfg["web_search"] = ws
-        rcfg["lecture_tips_with_refine"] = bool(lecture_tips_with_refine_var.get())
-        rcfg["lecture_content_after_refine"] = bool(lecture_content_after_refine_var.get())
-        lcfg["web_search"] = ws
-        lccfg["web_search"] = ws
-        cfg["refine"] = rcfg
-        cfg["lecture_tips"] = lcfg
-        cfg["lecture_content"] = lccfg
-        text = yaml.safe_dump(cfg, allow_unicode=True, sort_keys=False)
-        _gui_default_yaml.parent.mkdir(parents=True, exist_ok=True)
-        tmp = _gui_default_yaml.with_suffix(_gui_default_yaml.suffix + ".tmp")
-        tmp.write_text(text, encoding="utf-8")
-        tmp.replace(_gui_default_yaml)
-        logging.getLogger(__name__).info("已保存 GUI LLM 参数到 %s", _gui_default_yaml)
-
-    def _on_llm_flag_trace(*_: Any) -> None:
-        try:
-            _persist_llm_flags_from_gui()
-        except Exception as e:  # noqa: BLE001
-            logging.getLogger(__name__).warning("保存 configs/default.yaml 失败: %s", e)
-
-    for _bv in (
-        stream_refine_var,
-        web_search_var,
-        lecture_tips_with_refine_var,
-        lecture_content_after_refine_var,
-    ):
-        _bv.trace_add("write", _on_llm_flag_trace)
-
-    gui_llm_persist_cb.append(_persist_llm_flags_from_gui)
+    btn_pause["command"] = on_toggle_pause
+    btn_end["command"] = on_end
 
     root.mainloop()
     _LOG_QUEUE = None

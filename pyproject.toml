@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "nursing-mm-qbank"
-version = "0.1.7"
-description = "护理题库：VLM 转写与教材向修正（xlsx/jsonl）；LLM「讲师提醒」「讲课内容」（要点/口播稿 + Word 讲义）；GUI 勾选同步 configs/default.yaml；mm-qbank / mm-qbank-gui"
+version = "0.1.9"
+description = "护理题库：教师讲解 / 题目修正（scan→assemble→终步 LLM）；mm-qbank / mm-qbank-gui"
 requires-python = ">=3.10"
 dependencies = [
   "opencv-python>=4.8.0",
@@ -25,6 +25,9 @@ mm-qbank-gui = "mm_qbank.gui_app:main"
 
 [project.optional-dependencies]
 dev = ["pytest>=7.4.0"]
+# paddleclas 声明 opencv<=4.6，与主项目 opencv>=4.8 在 pip 解析时冲突；实际可用 4.8+，需 --no-deps 安装：
+#   pip install -e ".[pulc]" && pip install "paddleclas>=2.6.0" --no-deps
+pulc = ["paddlepaddle>=3.0.0"]
 
 [tool.pytest.ini_options]
 testpaths = ["test"]

@@ -38,6 +38,28 @@ def get_prompt(name: str, default: str) -> str:
     return default
 
 
+def vlm_prompts() -> tuple[str, str]:
+    """VLM 整页转写提示词。"""
+    return (
+        get_prompt("vlm_system.txt", _fb.VLM_SYSTEM),
+        get_prompt("vlm_user.txt", _fb.VLM_USER),
+    )
+
+
+def lecture_scan_vlm_prompts() -> tuple[str, str]:
+    return (
+        get_prompt("lecture_scan_vlm_system.txt", _fb.LECTURE_SCAN_VLM_SYSTEM),
+        get_prompt("lecture_scan_vlm_user.txt", _fb.LECTURE_SCAN_VLM_USER),
+    )
+
+
+def lecture_scan_assemble_prompts() -> tuple[str, str]:
+    return (
+        get_prompt("lecture_scan_assemble_system.txt", _fb.LECTURE_SCAN_ASSEMBLE_SYSTEM),
+        get_prompt("lecture_scan_assemble_user.txt", _fb.LECTURE_SCAN_ASSEMBLE_USER),
+    )
+
+
 def refine_system(*, include_lecture_tips: bool = False) -> str:
     base = get_prompt("refine_system.txt", _fb.REFINE_SYSTEM)
     if include_lecture_tips:

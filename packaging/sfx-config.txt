@@ -1,0 +1,10 @@
+;!@Install@!UTF-8!
+Title="mm-qbank-gui"
+BeginPrompt="是否将 mm-qbank-gui 解压到当前目录？\n\n解压后请运行 mm-qbank-gui\\mm-qbank-gui.exe。\nconfigs/、models/ 与 .env 位于 exe 同目录，可自行修改。"
+ExtractTitle="正在解压 mm-qbank-gui..."
+ExtractDialogText="请稍候..."
+ExtractPathText="解压到："
+GUIMode="2"
+InstallProgram=""
+RunProgram="mm-qbank-gui\\mm-qbank-gui.exe"
+;!@InstallEnd@!

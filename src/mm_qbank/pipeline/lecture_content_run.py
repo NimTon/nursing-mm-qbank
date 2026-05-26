@@ -9,7 +9,7 @@ from pathlib import Path
 from threading import Lock
 from typing import Any, cast
 
-from mm_qbank.config import load_config, llm_text_settings
+from mm_qbank.config import load_config, llm_text_settings, resolve_llm_model
 from mm_qbank.io.docx_out import write_lecture_handout_docx
 from mm_qbank.io.result_row_qa import qa_from_export_row
 from mm_qbank.io.xlsx_out import write_refined_rows_to_xlsx
@@ -218,17 +218,22 @@ def _merge_lc_xlsx_rows(
 def run_lecture_content_on_refined_rows(
     rows: list[dict[str, Any]],
     *,
-    out_xlsx: Path,
-    out_csv: Path | None = None,
     out_docx: Path | None = None,
+    out_xlsx: Path | None = None,
+    out_csv: Path | None = None,
     out_jsonl: Path | None = None,
+    write_stream_csv: bool = True,
+    write_xlsx: bool = True,
+    write_jsonl: bool = True,
     config_path: Path | None = None,
     model: str | None = None,
+    max_workers: int | None = None,
     on_progress: Any | None = None,
 ) -> dict[str, Any]:
     """
-    对已修正的行列表写入「要点」「讲课内容」，覆盖保存 ``out_xlsx``，并生成 ``_讲课稿.docx``。
-    流式 CSV 按 ``题号`` 断点续跑。
+    对已拆题行列表生成「要点」「讲课内容」，并写入讲义 Word。
+
+    默认另存 xlsx 与流式 CSV（按题号断点续跑）。``write_*=False`` 时仅保留 docx 等所需产物。
     """
     cfg = load_config(config_path)
     tl = llm_text_settings()
@@ -237,10 +242,8 @@ def run_lecture_content_on_refined_rows(
 
     lcfg = dict(cfg.get("lecture_content") or {})
     rcfg = dict(cfg.get("refine") or {})
-    include_lecture_tips = bool(rcfg.get("lecture_tips_with_refine", False))
-    text_model = (model or "").strip() or str(
-        (lcfg.get("model") or rcfg.get("model") or tl.get("text_model") or "gpt-4o-mini")
-    )
+    include_lecture_tips = False
+    text_model = resolve_llm_model(cfg, override=model)
     web_search = bool(lcfg.get("web_search", False))
     temp = float(lcfg.get("temperature", 0.4))
     timeout = float(
@@ -252,15 +255,38 @@ def run_lecture_content_on_refined_rows(
     if web_search and "dashscope" in burl.lower():
         default_headers = {"X-DashScope-Enable-Internet-Search": "enable"}
 
-    xout = out_xlsx.resolve()
-    base = xout.stem
-    _dir = xout.parent
-    cout = (out_csv or (_dir / f"{base}_lecture_content_stream.csv")).resolve()
-    dout = (out_docx or (_dir / f"{base}_讲课稿.docx")).resolve()
-    jout = (out_jsonl or (_dir / f"{base}_lecture_content.jsonl")).resolve()
+    xout = out_xlsx.resolve() if out_xlsx is not None else None
+    if out_docx is not None:
+        dout = out_docx.resolve()
+    elif xout is not None:
+        dout = (xout.parent / f"{xout.stem}_讲课稿.docx").resolve()
+    else:
+        raise ValueError("须指定 out_docx，或同时指定 out_xlsx 以推导 docx 路径")
 
-    complete_tihao = load_done_tihao_from_lecture_content_csv(cout)
-    by_tihao = _load_lc_map_from_tihao_csv(cout)
+    use_csv = write_stream_csv
+    cout: Path | None = None
+    if use_csv:
+        if out_csv is not None:
+            cout = out_csv.resolve()
+        elif xout is not None:
+            cout = (xout.parent / f"{xout.stem}_lecture_content_stream.csv").resolve()
+        else:
+            cout = (dout.parent / f"{dout.stem}_lecture_content_stream.csv").resolve()
+
+    jout: Path | None = None
+    if write_jsonl:
+        if out_jsonl is not None:
+            jout = out_jsonl.resolve()
+        elif xout is not None:
+            jout = (xout.parent / f"{xout.stem}_lecture_content.jsonl").resolve()
+        else:
+            jout = (dout.parent / f"{dout.stem}_lecture_content.jsonl").resolve()
+
+    complete_tihao: set[str] = set()
+    by_tihao: dict[str, tuple[str, str]] = {}
+    if cout is not None:
+        complete_tihao = load_done_tihao_from_lecture_content_csv(cout)
+        by_tihao = _load_lc_map_from_tihao_csv(cout)
 
     for row in rows:
         th = str(row.get("题号") or "").strip()
@@ -293,9 +319,13 @@ def run_lecture_content_on_refined_rows(
     total = len(work)
     flat_log: list[dict[str, Any]] = []
     n_batches = 0
+    max_rw = 0
 
     if total > 0:
-        raw_max_workers = lcfg.get("max_workers", rcfg.get("max_workers"))
+        if max_workers is not None:
+            raw_max_workers = max_workers
+        else:
+            raw_max_workers = lcfg.get("max_workers", rcfg.get("max_workers"))
         chunk_size = 1
         batches: list[tuple[int, int, int]] = []
         for batch_idx, st in enumerate(range(0, total, chunk_size), start=1):
@@ -304,10 +334,10 @@ def run_lecture_content_on_refined_rows(
         n_batches = len(batches)
         max_rw = _cap_workers(n_batches, raw_max_workers)
         _log.info(
-            "lecture-content(refined) 待处理题=%s 批次数=%s（每批 1 题）max_workers=%s",
+            "lecture-content 待处理题=%s，ThreadPoolExecutor max_workers=%s（%s 题各 1 次 LLM 请求，并行执行）",
             total,
-            n_batches,
             max_rw,
+            n_batches,
         )
         csv_lock = Lock()
         prog_lock = Lock()
@@ -330,7 +360,7 @@ def run_lecture_content_on_refined_rows(
                 default_headers=default_headers,
             )
             up = lecture_content_user_payload_by_tihao(
-                batch_id=f"{Path(xout).name} #{bix}/{n_batches}",
+                batch_id=f"{dout.name} #{bix}/{n_batches}",
                 items=items,
                 web_search=web_search,
             )
@@ -408,11 +438,21 @@ def run_lecture_content_on_refined_rows(
                     th, _, _ = qa_from_export_row(row)
                     pt, lc = by_out.get(th, ("", ""))
                     flat_csv.append({"题号": th, "要点": pt, "讲课内容": lc})
-            try:
-                with csv_lock:
-                    append_lecture_content_tihao_csv(cout, flat_csv)
-            except Exception as e:  # noqa: BLE001
-                _log.warning("写讲课内容 CSV 失败: %s", e)
+            if cout is not None:
+                try:
+                    with csv_lock:
+                        append_lecture_content_tihao_csv(cout, flat_csv)
+                except Exception as e:  # noqa: BLE001
+                    _log.warning("写讲课内容 CSV 失败: %s", e)
+                else:
+                    for rec in flat_csv:
+                        thk = str(rec.get("题号", "") or "").strip()
+                        if thk:
+                            ptk = str(rec.get("要点", "") or "").strip()
+                            ltk = str(rec.get("讲课内容", "") or "").strip()
+                            by_tihao[thk] = (ptk, ltk)
+                            if ptk and ltk:
+                                complete_tihao.add(thk)
             else:
                 for rec in flat_csv:
                     thk = str(rec.get("题号", "") or "").strip()
@@ -420,8 +460,7 @@ def run_lecture_content_on_refined_rows(
                         ptk = str(rec.get("要点", "") or "").strip()
                         ltk = str(rec.get("讲课内容", "") or "").strip()
                         by_tihao[thk] = (ptk, ltk)
-                        if ptk and ltk:
-                            complete_tihao.add(thk)
+            if flat_csv:
                 for _ in flat_csv:
                     with prog_lock:
                         n_done += 1
@@ -443,36 +482,39 @@ def run_lecture_content_on_refined_rows(
                     f.result()
 
     _merge_lc_into_refined_rows(rows, by_tihao)
-    jout.parent.mkdir(parents=True, exist_ok=True)
-    j_full: list[dict[str, Any]] = []
-    for row in rows:
-        th, _, _ = qa_from_export_row(row)
-        j_full.append(
-            {
-                "题号": th,
-                "要点": str(row.get("要点") or ""),
-                "讲课内容": str(row.get("讲课内容") or ""),
-            }
+    if jout is not None:
+        jout.parent.mkdir(parents=True, exist_ok=True)
+        j_full: list[dict[str, Any]] = []
+        for row in rows:
+            th, _, _ = qa_from_export_row(row)
+            j_full.append(
+                {
+                    "题号": th,
+                    "要点": str(row.get("要点") or ""),
+                    "讲课内容": str(row.get("讲课内容") or ""),
+                }
+            )
+        jout.write_text(
+            "\n".join(json.dumps(x, ensure_ascii=False) for x in j_full) + ("\n" if j_full else ""),
+            encoding="utf-8",
         )
-    jout.write_text(
-        "\n".join(json.dumps(x, ensure_ascii=False) for x in j_full) + ("\n" if j_full else ""),
-        encoding="utf-8",
-    )
-    write_refined_rows_to_xlsx(
-        xout,
-        rows,
-        include_lecture_tips=include_lecture_tips,
-        include_lecture_content=True,
-    )
+    if write_xlsx and xout is not None:
+        write_refined_rows_to_xlsx(
+            xout,
+            rows,
+            include_lecture_tips=include_lecture_tips,
+            include_lecture_content=True,
+        )
     write_lecture_handout_docx(dout, rows)
     return {
         "n_pending": total,
         "n_stream_rows": len(flat_log),
         "n_batches": n_batches,
-        "out_xlsx": str(xout),
-        "out_csv": str(cout),
+        "max_workers": max_rw if total > 0 else 0,
+        "out_xlsx": str(xout) if xout is not None else "",
+        "out_csv": str(cout) if cout is not None else "",
         "out_docx": str(dout),
-        "out_jsonl": str(jout),
+        "out_jsonl": str(jout) if jout is not None else "",
         "model": text_model,
         "web_search": web_search,
     }
@@ -497,9 +539,7 @@ def run_lecture_content_from_xlsx(
 
     lcfg = dict(cfg.get("lecture_content") or {})
     rcfg = dict(cfg.get("refine") or {})
-    text_model = (model or "").strip() or str(
-        (lcfg.get("model") or rcfg.get("model") or tl.get("text_model") or "gpt-4o-mini")
-    )
+    text_model = resolve_llm_model(cfg, override=model)
     web_search = bool(lcfg.get("web_search", False))
     temp = float(lcfg.get("temperature", 0.4))
     timeout = float(

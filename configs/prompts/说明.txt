@@ -1,7 +1,11 @@
 本目录为各阶段模型提示词（UTF-8 文本）。可在此修改后保存，重新运行程序即可生效，一般无需重打包。
 
+版本变更摘要见上级目录「版本摘要.txt」（与程序 version 同步）。
+
 文件说明：
-- vlm_system.txt / vlm_user.txt         — 多模态 VLM 整页转写
+- vlm_system.txt / vlm_user.txt         — 多模态 VLM 整页转写（单页）
+- lecture_scan_vlm_system.txt / lecture_scan_vlm_user.txt — 教师讲解分支：逐页 VLM（页码+逐行原文）
+- lecture_scan_assemble_system.txt / lecture_scan_assemble_user.txt — 按页码拼接后 LLM 重组完整题目
 - llm_compose_system.txt / llm_compose_user.txt  — 历史/备用文本拆题模板；用户模板中整页原文占位符为 __PAGE_PLAIN__
 - refine_system.txt / refine_example.txt / refine_user.txt  — 修正与导出；refine_user 中含占位 __REFINE_EXAMPLE__、__WEB_STATUS__、__PAGE_ID__、__MERGED_JSON__；同批「讲师提醒」时可含 __REFINE_LECTURE_BLOCK__（或由程序插入 refine_user_lecture_block 内容）
 - refine_system_lecture_addon.txt / refine_example_with_lecture.txt / refine_user_lecture_block.txt  — 修正阶段同批输出「讲师提醒」时的追加模板

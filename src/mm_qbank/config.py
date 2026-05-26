@@ -47,6 +47,50 @@ def llm_text_settings() -> dict[str, str | None]:
     }
 
 
+def _yaml_model(cfg: dict[str, Any], *paths: tuple[str, ...]) -> str:
+    for path in paths:
+        node: Any = cfg
+        for key in path:
+            if not isinstance(node, dict):
+                node = None
+                break
+            node = node.get(key)
+        if node is not None and str(node).strip() and str(node).strip().lower() != "null":
+            return str(node).strip()
+    return ""
+
+
+def resolve_vlm_model(cfg: dict[str, Any], *, override: str | None = None) -> str:
+    """模型优先级：CLI 覆盖 > .env ``VLM_MODEL`` > yaml（兼容旧配置）> 默认 ``gpt-4o``。"""
+    if (override or "").strip():
+        return override.strip()
+    explicit = (os.getenv("VLM_MODEL") or "").strip()
+    if explicit:
+        return explicit
+    yaml_m = _yaml_model(cfg, ("lecture_scan", "vlm", "model"), ("vlm", "model"))
+    if yaml_m:
+        return yaml_m
+    return "gpt-4o"
+
+
+def resolve_llm_model(cfg: dict[str, Any], *, override: str | None = None) -> str:
+    """模型优先级：CLI 覆盖 > .env ``LLM_MODEL`` > yaml（兼容旧配置）> 默认 ``gpt-4o-mini``。"""
+    if (override or "").strip():
+        return override.strip()
+    explicit = (os.getenv("LLM_MODEL") or "").strip()
+    if explicit:
+        return explicit
+    yaml_m = _yaml_model(
+        cfg,
+        ("lecture_content", "model"),
+        ("refine", "model"),
+        ("lecture_scan", "assemble", "model"),
+    )
+    if yaml_m:
+        return yaml_m
+    return llm_text_settings()["text_model"] or "gpt-4o-mini"
+
+
 def load_config(config_path: Path | None = None) -> dict[str, Any]:
     root = project_root()
     load_dotenv(root / ".env")
