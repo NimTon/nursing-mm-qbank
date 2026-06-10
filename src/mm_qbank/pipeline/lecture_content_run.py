@@ -17,6 +17,7 @@ from mm_qbank.io.xlsx_lecture import read_result_xlsx, write_lecture_tips_xlsx
 from mm_qbank.llm.client import OpenAICompatClient
 from mm_qbank.llm.jsonutil import parse_json_object
 from mm_qbank.llm.retry import call_with_retries_timeout
+from mm_qbank.pipeline.vlm_merge import row_aggregate_key
 from mm_qbank.prompts_loader import (
     lecture_content_system,
     lecture_content_user_payload_by_row,
@@ -25,7 +26,7 @@ from mm_qbank.prompts_loader import (
 
 _log = logging.getLogger(__name__)
 
-_STREAM_BY_TIHAO: tuple[str, ...] = ("题号", "要点", "讲课内容")
+_STREAM_BY_TIHAO: tuple[str, ...] = ("题号", "题目类型", "要点", "讲课内容")
 _STREAM_BY_ROW: tuple[str, ...] = ("行号", "题号", "要点", "讲课内容")
 
 
@@ -36,6 +37,23 @@ def _cap_workers(n_tasks: int, raw: Any) -> int:
         w = int(raw)
     w = max(1, w)
     return min(w, max(1, n_tasks))
+
+
+def _build_lc_by_bucket_from_parsed(
+    parsed: list[dict[str, Any]],
+    chunk: list[dict[str, Any]],
+) -> dict[str, tuple[str, str]]:
+    """LLM ``items`` 与输入 chunk 逐条同序对应，用输入行的聚合键写入。"""
+    by_out: dict[str, tuple[str, str]] = {}
+    for row, it in zip(chunk, parsed):
+        bk = row_aggregate_key(row)
+        if not bk:
+            continue
+        by_out[bk] = (
+            str(it.get("要点", "") or "").strip(),
+            str(it.get("讲课内容", "") or "").strip(),
+        )
+    return by_out
 
 
 def _parse_items_json(raw: str) -> list[dict[str, Any]]:
@@ -84,11 +102,11 @@ def load_done_tihao_from_lecture_content_csv(path: Path) -> set[str]:
             for row in r:
                 if not row:
                     continue
-                t = str(row.get("题号", "") or "").strip()
+                bk = row_aggregate_key(row)
                 pt = str(row.get("要点", "") or "").strip()
                 lc = str(row.get("讲课内容", "") or "").strip()
-                if t and pt and lc:
-                    done.add(t)
+                if bk and pt and lc:
+                    done.add(bk)
     except OSError:
         return set()
     return done
@@ -144,10 +162,10 @@ def _load_lc_map_from_tihao_csv(path: Path) -> dict[str, tuple[str, str]]:
             for row in r:
                 if not row:
                     continue
-                th = str(row.get("题号", "") or "").strip()
-                if not th:
+                bk = row_aggregate_key(row)
+                if not bk:
                     continue
-                out[th] = (
+                out[bk] = (
                     str(row.get("要点", "") or ""),
                     str(row.get("讲课内容", "") or ""),
                 )
@@ -182,11 +200,11 @@ def _load_lc_map_from_row_csv(path: Path) -> dict[int, tuple[str, str, str]]:
 
 
 def _merge_lc_into_refined_rows(
-    rows: list[dict[str, Any]], by_tihao: dict[str, tuple[str, str]]
+    rows: list[dict[str, Any]], by_bucket: dict[str, tuple[str, str]]
 ) -> None:
     for row in rows:
-        th = str(row.get("题号") or "").strip()
-        pt, lc = by_tihao.get(th, ("", ""))
+        bk = row_aggregate_key(row)
+        pt, lc = by_bucket.get(bk, ("", ""))
         row["要点"] = pt
         row["讲课内容"] = lc
 
@@ -282,33 +300,34 @@ def run_lecture_content_on_refined_rows(
         else:
             jout = (dout.parent / f"{dout.stem}_lecture_content.jsonl").resolve()
 
-    complete_tihao: set[str] = set()
-    by_tihao: dict[str, tuple[str, str]] = {}
+    complete_buckets: set[str] = set()
+    by_bucket: dict[str, tuple[str, str]] = {}
     if cout is not None:
-        complete_tihao = load_done_tihao_from_lecture_content_csv(cout)
-        by_tihao = _load_lc_map_from_tihao_csv(cout)
+        complete_buckets = load_done_tihao_from_lecture_content_csv(cout)
+        by_bucket = _load_lc_map_from_tihao_csv(cout)
 
     for row in rows:
-        th = str(row.get("题号") or "").strip()
-        if not th:
+        bk = row_aggregate_key(row)
+        if not bk:
             continue
-        if th in by_tihao:
+        if bk in by_bucket:
             continue
         p0 = str(row.get("要点") or "").strip()
         l0 = str(row.get("讲课内容") or "").strip()
         if p0 or l0:
-            by_tihao[th] = (p0, l0)
+            by_bucket[bk] = (p0, l0)
 
     work: list[dict[str, Any]] = []
     for row in rows:
+        bk = row_aggregate_key(row)
         th = str(row.get("题号") or "").strip()
         _, q, a = qa_from_export_row(row)
-        if not th and not (q or a):
+        if not bk and not (q or a):
             continue
-        if th and th in complete_tihao:
+        if bk and bk in complete_buckets:
             continue
-        if th:
-            pt0, lc0 = by_tihao.get(th, ("", ""))
+        if bk:
+            pt0, lc0 = by_bucket.get(bk, ("", ""))
             if pt0.strip() and lc0.strip():
                 continue
         if not (q or a):
@@ -419,25 +438,33 @@ def run_lecture_content_on_refined_rows(
                 flat_csv = []
                 for row in chunk:
                     th, _, _ = qa_from_export_row(row)
-                    flat_csv.append({"题号": th, "要点": "", "讲课内容": raw_lc})
-            else:
-                by_out: dict[str, tuple[str, str]] = {}
-                for it in parsed:
-                    tk = str(it.get("题号", "") or "").strip()
-                    if not tk:
-                        continue
-                    by_out[tk] = (
-                        str(it.get("要点", "") or "").strip(),
-                        str(it.get("讲课内容", "") or "").strip(),
+                    qt = str(row.get("题目类型") or "").strip()
+                    flat_csv.append(
+                        {
+                            "题号": th,
+                            "题目类型": qt or "未知",
+                            "要点": "",
+                            "讲课内容": raw_lc,
+                        }
                     )
+            else:
+                by_out = _build_lc_by_bucket_from_parsed(parsed, chunk)
                 if len(chunk) == len(items) and len(parsed) < len(items):
                     _log.warning("batch %s: 返回条数=%s 少于输入=%s", bix, len(parsed), len(items))
 
                 flat_csv = []
                 for row in chunk:
                     th, _, _ = qa_from_export_row(row)
-                    pt, lc = by_out.get(th, ("", ""))
-                    flat_csv.append({"题号": th, "要点": pt, "讲课内容": lc})
+                    pt, lc = by_out.get(row_aggregate_key(row), ("", ""))
+                    qt = str(row.get("题目类型") or "").strip()
+                    flat_csv.append(
+                        {
+                            "题号": th,
+                            "题目类型": qt or "未知",
+                            "要点": pt,
+                            "讲课内容": lc,
+                        }
+                    )
             if cout is not None:
                 try:
                     with csv_lock:
@@ -446,20 +473,20 @@ def run_lecture_content_on_refined_rows(
                     _log.warning("写讲课内容 CSV 失败: %s", e)
                 else:
                     for rec in flat_csv:
-                        thk = str(rec.get("题号", "") or "").strip()
-                        if thk:
+                        bk = row_aggregate_key(rec)
+                        if bk:
                             ptk = str(rec.get("要点", "") or "").strip()
                             ltk = str(rec.get("讲课内容", "") or "").strip()
-                            by_tihao[thk] = (ptk, ltk)
+                            by_bucket[bk] = (ptk, ltk)
                             if ptk and ltk:
-                                complete_tihao.add(thk)
+                                complete_buckets.add(bk)
             else:
                 for rec in flat_csv:
-                    thk = str(rec.get("题号", "") or "").strip()
-                    if thk:
+                    bk = row_aggregate_key(rec)
+                    if bk:
                         ptk = str(rec.get("要点", "") or "").strip()
                         ltk = str(rec.get("讲课内容", "") or "").strip()
-                        by_tihao[thk] = (ptk, ltk)
+                        by_bucket[bk] = (ptk, ltk)
             if flat_csv:
                 for _ in flat_csv:
                     with prog_lock:
@@ -481,7 +508,7 @@ def run_lecture_content_on_refined_rows(
                 for f in as_completed(futs):
                     f.result()
 
-    _merge_lc_into_refined_rows(rows, by_tihao)
+    _merge_lc_into_refined_rows(rows, by_bucket)
     if jout is not None:
         jout.parent.mkdir(parents=True, exist_ok=True)
         j_full: list[dict[str, Any]] = []
