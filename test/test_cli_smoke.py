@@ -30,7 +30,8 @@ def test_mm_qbank_cli_help_exits_zero() -> None:
     out = r.stdout or ""
     assert "lecture-scan" in out
     assert "correction-scan" in out
-    assert "vlm-text" not in out
+    assert "vlm-text" in out
+    assert "vlm-refine" in out
 
 
 def test_lecture_scan_subparser_help() -> None:

@@ -18,7 +18,7 @@ pip install -e .
 ## 主流程
 
 1. **`vlm-text`** — 多模态读图，输出每页 `.{page_id}.json`（`题号/类型/内容`）+ `.txt` + `pages.jsonl`  
-2. **`vlm-refine`** — 按**题号**合并「问题」和「解析」，经文本 LLM 填写修正后字段，生成 **`refined_merged.xlsx` + `refined_merged.jsonl`**  
+2. **`vlm-refine`** — 按**题号 + 题目类型**合并「问题」和「解析」（避免单选/多选同号串题），经文本 LLM 填写修正后字段，生成 **`refined_merged.xlsx` + `refined_merged.jsonl`**  
 3.（可选）**`llm-compose`** — 读每页 `text_file` 的整段字，再拆为题目数组（JSONL 每行一页）
 
 ### 1. 整页转写（VLM）

@@ -7,6 +7,8 @@ from pathlib import Path
 
 from mm_qbank.logging_utils import configure_logging
 from mm_qbank.pipeline.lecture_scan_run import run_correction_scan_pipeline, run_lecture_scan_pipeline
+from mm_qbank.pipeline.refine_vlm_run import run_refine_from_compose_jsonl, run_refine_vlm_merged
+from mm_qbank.pipeline.vlm_text_run import run_vlm_text_only
 
 _log = logging.getLogger(__name__)
 
@@ -71,6 +73,78 @@ def main() -> None:
         "--refine-model", dest="refine_model", type=str, default=None, help="覆盖 .env 中 LLM_MODEL"
     )
 
+    vlm = sub.add_parser(
+        "vlm-text",
+        parents=[parent],
+        help="多模态整页转写：每页 json（题号/类型/内容）+ pages.jsonl",
+    )
+    vlm.add_argument("--in", dest="input_dir", type=Path, required=True, help="输入图片目录（递归扫描）")
+    vlm.add_argument(
+        "--out-dir",
+        dest="out_dir",
+        type=Path,
+        default=None,
+        help="输出根目录（默认 data/out/vlm_text）",
+    )
+    vlm.add_argument("--config", dest="config", type=Path, default=None, help="configs/default.yaml")
+    vlm.add_argument(
+        "--model",
+        dest="mm_model",
+        type=str,
+        default=None,
+        help="覆盖 .env 中 VLM_MODEL",
+    )
+
+    refine = sub.add_parser(
+        "vlm-refine",
+        parents=[parent],
+        help="按题号+题型合并问题/解析，教材向修正并导出 xlsx+jsonl",
+    )
+    srcg = refine.add_mutually_exclusive_group(required=True)
+    srcg.add_argument(
+        "--manifest",
+        dest="refine_manifest",
+        type=Path,
+        default=None,
+        help="vlm-text 的 pages.jsonl 路径",
+    )
+    srcg.add_argument(
+        "--compose-jsonl",
+        dest="compose_jsonl",
+        type=Path,
+        default=None,
+        help="llm-compose 输出的 jsonl",
+    )
+    refine.add_argument(
+        "--out-jsonl",
+        dest="refine_jsonl",
+        type=Path,
+        default=None,
+        help="默认 data/out/refine/refined_merged.jsonl",
+    )
+    refine.add_argument(
+        "--out-xlsx",
+        dest="refine_xlsx",
+        type=Path,
+        default=None,
+        help="默认 data/out/refine/refined_merged.xlsx",
+    )
+    refine.add_argument(
+        "--out-csv",
+        dest="refine_csv",
+        type=Path,
+        default=None,
+        help="流式 CSV，默认 refined_merged_stream.csv",
+    )
+    refine.add_argument("--config", dest="refine_config", type=Path, default=None, help="configs/default.yaml")
+    refine.add_argument(
+        "--model",
+        dest="refine_model",
+        type=str,
+        default=None,
+        help="覆盖 .env 中 LLM_MODEL",
+    )
+
     verify = sub.add_parser(
         "verify-config",
         parents=[parent],
@@ -108,6 +182,34 @@ def main() -> None:
             assemble_model=args.assemble_model,
             refine_model=args.refine_model,
         )
+        print(json.dumps(summary, ensure_ascii=False, indent=2))
+    elif args.cmd == "vlm-text":
+        summary = run_vlm_text_only(
+            input_dir=args.input_dir,
+            out_dir=args.out_dir,
+            config_path=args.config,
+            model=args.mm_model,
+        )
+        print(json.dumps(summary, ensure_ascii=False, indent=2))
+    elif args.cmd == "vlm-refine":
+        if args.compose_jsonl is not None:
+            summary = run_refine_from_compose_jsonl(
+                compose_jsonl=args.compose_jsonl,
+                out_jsonl=args.refine_jsonl,
+                out_csv=args.refine_csv,
+                out_xlsx=args.refine_xlsx,
+                config_path=args.refine_config,
+                model=args.refine_model,
+            )
+        else:
+            summary = run_refine_vlm_merged(
+                manifest_path=args.refine_manifest,
+                out_jsonl=args.refine_jsonl,
+                out_csv=args.refine_csv,
+                out_xlsx=args.refine_xlsx,
+                config_path=args.refine_config,
+                model=args.refine_model,
+            )
         print(json.dumps(summary, ensure_ascii=False, indent=2))
     elif args.cmd == "verify-config":
         try:
