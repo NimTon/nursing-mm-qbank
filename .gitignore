@@ -11,9 +11,6 @@ build/
 venv/
 venv-*/
 
-# Env with secrets (use .env.example in repo)
-.env
-
 # Test / tools
 .pytest_cache/
 .coverage
