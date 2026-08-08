@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import queue
@@ -160,6 +161,32 @@ def _batch_output_slug(batch_src: Path, root: Path) -> str:
 
 def _folder_batch_display_name(batch_src: Path, root: Path) -> str:
     return _batch_output_slug(batch_src, root)
+
+
+def _write_batch_done(
+    batch_out: Path,
+    batch_src: Path,
+    root: Path,
+    sm_b: dict[str, Any],
+    summaries: list[dict[str, Any]],
+) -> None:
+    """每批次跑完后立即写 checkpoint，记录该批次状态；崩溃重启后可检测跳过。"""
+    done = {
+        "batch_index": len(summaries) - 1,
+        "batch_name": _folder_batch_display_name(batch_src, root),
+        "batch_out": str(batch_out.resolve()),
+        "mode": sm_b.get("mode") or "",
+        "n_questions": sm_b.get("n_questions", 0),
+        "docx": sm_b.get("out_docx", ""),
+        "xlsx": sm_b.get("out_xlsx") or (sm_b.get("refine") or {}).get("out_xlsx", ""),
+        "manifest": sm_b.get("manifest", ""),
+        "cancelled": sm_b.get("cancelled", False),
+        "summaries_so_far": summaries,
+    }
+    ckpt_path = batch_out / "_batch_done.json"
+    tmp = ckpt_path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(done, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.replace(ckpt_path)
 
 
 def _install_gui_mascot_strip(parent: tk.Misc, font: tuple[Any, ...]) -> None:
@@ -633,6 +660,7 @@ def main() -> None:
                     loops = [(wd, out)]
                 batch_prog["n"] = len(loops)
                 summaries: list[dict[str, Any]] = []
+
                 for bi, (batch_src, batch_out) in enumerate(loops):
                     batch_prog["idx"] = bi
                     while user_paused[0] and not run_cancel.is_set():
@@ -641,6 +669,26 @@ def main() -> None:
                         sm_acc = {"cancelled": True, "mode": mode, "out_dir": str(out)}
                         break
                     batch_out.mkdir(parents=True, exist_ok=True)
+
+                    # --- 批次级断点恢复：若已有 .done 标记则跳过该批次 ---
+                    batch_done_marker = batch_out / "_batch_done.json"
+                    if batch_done_marker.exists():
+                        _append_t(f"\n[批次 {bi + 1}/{len(loops)}] 已完成，跳过（断点恢复）\n")
+                        try:
+                            prev = json.loads(batch_done_marker.read_text(encoding="utf-8"))
+                            summaries.append(
+                                {
+                                    "name": _folder_batch_display_name(batch_src, wd) if folder_batches else batch_src.name,
+                                    "out_sub": str(batch_out),
+                                    "docx": prev.get("docx", ""),
+                                    "xlsx": prev.get("xlsx", ""),
+                                    "n_questions": prev.get("n_questions", 0),
+                                }
+                            )
+                        except Exception:  # noqa: BLE001
+                            pass
+                        continue
+
                     pipeline_in = batch_src
                     staging: Path | None = None
                     if folder_batches:
@@ -674,10 +722,13 @@ def main() -> None:
                     finally:
                         if staging:
                             shutil.rmtree(staging, ignore_errors=True)
+
                     if sm_b.get("cancelled"):
+                        # 用户点结束：仍写当前已完成的批次 checkpoint
+                        _write_batch_done(batch_out, batch_src, wd, sm_b, summaries)
                         sm_acc = {**sm_b, "mode": mode, "out_dir": str(out)}
                         break
-                    sm_acc = {**sm_b, "mode": mode, "out_dir": str(out)}
+
                     summaries.append(
                         {
                             "name": _folder_batch_display_name(batch_src, wd) if folder_batches else batch_src.name,
@@ -687,9 +738,16 @@ def main() -> None:
                             "n_questions": sm_b.get("n_questions", 0),
                         }
                     )
-                if len(loops) > 1 and err is None and not sm_acc.get("cancelled"):
-                    sm_acc["folder_batch_summaries"] = summaries
-                    sm_acc["folder_batch_count"] = len(loops)
+                    _write_batch_done(batch_out, batch_src, wd, sm_b, summaries)
+
+                if err is None and not sm_acc.get("cancelled"):
+                    sm_acc = {
+                        "cancelled": False,
+                        "mode": mode,
+                        "out_dir": str(out),
+                        "folder_batch_summaries": summaries,
+                        "folder_batch_count": len(summaries),
+                    }
             except Exception as ex:  # noqa: BLE001
                 err = str(ex)
                 sm_acc = {}

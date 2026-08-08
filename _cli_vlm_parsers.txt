@@ -1,0 +1,72 @@
+    vlm = sub.add_parser(
+        "vlm-text",
+        parents=[parent],
+        help="多模态大模型整页转写，输出 .json + .txt + pages.jsonl",
+    )
+    vlm.add_argument("--in", dest="input_dir", type=Path, required=True, help="输入图片目录（递归扫描）")
+    vlm.add_argument(
+        "--out-dir",
+        dest="out_dir",
+        type=Path,
+        default=None,
+        help="输出根目录（默认：项目下 data/out/vlm_text）",
+    )
+    vlm.add_argument("--config", dest="config", type=Path, default=None, help="覆盖默认 configs/default.yaml")
+    vlm.add_argument(
+        "--model",
+        dest="mm_model",
+        type=str,
+        default=None,
+        help="覆盖多模态模型名（缺省为配置 vlm.model 或环境变量 VLM_MODEL）",
+    )
+
+    refine = sub.add_parser(
+        "vlm-refine",
+        parents=[parent],
+        help="读 pages.jsonl 或 llm_compose_merged.jsonl，按题号合并问题+解析，再 LLM 对照护理学教材修正，导出 xlsx+jsonl",
+    )
+    srcg = refine.add_mutually_exclusive_group(required=True)
+    srcg.add_argument(
+        "--manifest",
+        dest="refine_manifest",
+        type=Path,
+        default=None,
+        help="vlm-text 的 pages.jsonl 路径",
+    )
+    srcg.add_argument(
+        "--compose-jsonl",
+        dest="compose_jsonl",
+        type=Path,
+        default=None,
+        help="llm-compose 的输出 jsonl（如 vlm_gui_*/llm_compose_merged.jsonl）",
+    )
+    refine.add_argument(
+        "--out-jsonl",
+        dest="refine_jsonl",
+        type=Path,
+        default=None,
+        help="每题一行 JSON 的 jsonl（默认 data/out/refine/refined_merged.jsonl）",
+    )
+    refine.add_argument(
+        "--out-xlsx",
+        dest="refine_xlsx",
+        type=Path,
+        default=None,
+        help="Excel 表（默认 data/out/refine/refined_merged.xlsx）",
+    )
+    refine.add_argument(
+        "--out-csv",
+        dest="refine_csv",
+        type=Path,
+        default=None,
+        help="流式追加 CSV（默认 data/out/refine/refined_merged_stream.csv）",
+    )
+    refine.add_argument("--config", dest="refine_config", type=Path, default=None, help="configs/default.yaml")
+    refine.add_argument(
+        "--model",
+        dest="refine_model",
+        type=str,
+        default=None,
+        help="覆盖 refine.model 或环境变量 LLM_MODEL",
+    )
+

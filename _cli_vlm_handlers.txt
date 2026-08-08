@@ -1,0 +1,57 @@
+if args.cmd == "vlm-text":
+        summary = run_vlm_text_only(
+            input_dir=args.input_dir,
+            out_dir=args.out_dir,
+            config_path=args.config,
+            model=args.mm_model,
+        )
+        print(json.dumps(summary, ensure_ascii=False, indent=2))
+    elif args.cmd == "vlm-refine":
+        if args.compose_jsonl is not None:
+            summary = run_refine_from_compose_jsonl(
+                compose_jsonl=args.compose_jsonl,
+                out_jsonl=args.refine_jsonl,
+                out_csv=args.refine_csv,
+                out_xlsx=args.refine_xlsx,
+                config_path=args.refine_config,
+                model=args.refine_model,
+            )
+        else:
+            summary = run_refine_vlm_merged(
+                manifest_path=args.refine_manifest,
+                out_jsonl=args.refine_jsonl,
+                out_csv=args.refine_csv,
+                out_xlsx=args.refine_xlsx,
+                config_path=args.refine_config,
+                model=args.refine_model,
+            )
+        print(json.dumps(summary, ensure_ascii=False, indent=2))
+    elif args.cmd == "llm-compose":
+        summary = run_llm_compose_manifest(
+            manifest_path=args.manifest,
+            out_jsonl=args.out_jsonl,
+            config_path=args.config,
+            model=args.model,
+        )
+        print(json.dumps(summary, ensure_ascii=False, indent=2))
+    elif args.cmd == "xlsx-lecture-tips":
+        summary = run_lecture_tips_from_xlsx(
+            in_xlsx=args.in_xlsx,
+            out_xlsx=args.out_xlsx,
+            out_csv=args.lecture_csv,
+            out_jsonl=args.lecture_jsonl,
+            config_path=args.lecture_config,
+            model=args.lecture_model,
+        )
+        print(json.dumps(summary, ensure_ascii=False, indent=2))
+    elif args.cmd == "xlsx-lecture-content":
+        summary = run_lecture_content_from_xlsx(
+            in_xlsx=args.lc_in_xlsx,
+            out_xlsx=args.lc_out_xlsx,
+            out_csv=args.lc_csv,
+            out_jsonl=args.lc_jsonl,
+            config_path=args.lc_config,
+            model=args.lc_model,
+        )
+        print(json.dumps(summary, ensure_ascii=False, indent=2))
+    
