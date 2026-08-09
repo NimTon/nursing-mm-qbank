@@ -95,6 +95,7 @@ class OpenAICompatClient:
         model: str,
         messages: list[dict[str, Any]],
         temperature: float = 0.2,
+        max_tokens: int | None = None,
         timeout: float | None = None,
     ) -> str:
         kwargs: dict[str, Any] = {
@@ -102,6 +103,8 @@ class OpenAICompatClient:
             "messages": messages,
             "temperature": temperature,
         }
+        if max_tokens is not None:
+            kwargs["max_tokens"] = int(max_tokens)
         if timeout is not None:
             kwargs["timeout"] = timeout
         try:

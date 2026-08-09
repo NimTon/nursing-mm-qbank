@@ -264,6 +264,8 @@ def run_lecture_content_on_refined_rows(
     text_model = resolve_llm_model(cfg, override=model)
     web_search = bool(lcfg.get("web_search", False))
     temp = float(lcfg.get("temperature", 0.4))
+    max_tokens_raw = lcfg.get("max_tokens", 8192)
+    max_tokens = max(1, int(max_tokens_raw)) if max_tokens_raw is not None else None
     timeout = float(
         lcfg.get("timeout_seconds", rcfg.get("timeout_seconds", 300.0) or 300.0) or 300.0
     )
@@ -393,6 +395,7 @@ def run_lecture_content_on_refined_rows(
                             {"role": "user", "content": up},
                         ],
                         temperature=temp,
+                        max_tokens=max_tokens,
                         timeout=float(tout),
                     )
                 except Exception:  # noqa: BLE001
@@ -403,6 +406,7 @@ def run_lecture_content_on_refined_rows(
                             {"role": "user", "content": up},
                         ],
                         temperature=temp,
+                        max_tokens=max_tokens,
                         timeout=None,
                     )
 
@@ -424,10 +428,15 @@ def run_lecture_content_on_refined_rows(
             try:
                 parsed = _parse_items_json(content)
             except json.JSONDecodeError as e:
+                invalid_dir = dout.parent / "lecture_content_invalid_json"
+                invalid_dir.mkdir(parents=True, exist_ok=True)
+                invalid_path = invalid_dir / f"batch_{bix:04d}.txt"
+                invalid_path.write_text(content, encoding="utf-8")
                 _log.warning(
-                    "lecture-content batch=%s/%s JSON 解析失败，整段回复写入「讲课内容」（要点留空）: %s",
+                    "lecture-content batch=%s/%s JSON 解析失败，原始回复已保存至 %s；整段回复写入「讲课内容」（要点留空）: %s",
                     bix,
                     n_batches,
+                    invalid_path,
                     e,
                 )
                 parsed = None

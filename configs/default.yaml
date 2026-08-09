@@ -37,5 +37,7 @@ refine:
 lecture_content:
   max_workers: 4
   temperature: 0.4
+  # 单题讲课内容要求 2200–3200 汉字；显式提高完成输出上限，避免网关默认上限截断 JSON。
+  max_tokens: 8192
   web_search: true
   timeout_seconds: 300.0

@@ -741,12 +741,18 @@ def main() -> None:
                     _write_batch_done(batch_out, batch_src, wd, sm_b, summaries)
 
                 if err is None and not sm_acc.get("cancelled"):
+                    n_questions = sum(int(x.get("n_questions", 0) or 0) for x in summaries)
+                    first_docx = next((str(x.get("docx") or "") for x in summaries if x.get("docx")), "")
+                    first_xlsx = next((str(x.get("xlsx") or "") for x in summaries if x.get("xlsx")), "")
                     sm_acc = {
                         "cancelled": False,
                         "mode": mode,
                         "out_dir": str(out),
                         "folder_batch_summaries": summaries,
                         "folder_batch_count": len(summaries),
+                        "n_questions": n_questions,
+                        "out_docx": first_docx,
+                        "out_xlsx": first_xlsx,
                     }
             except Exception as ex:  # noqa: BLE001
                 err = str(ex)
