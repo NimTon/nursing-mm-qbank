@@ -19,6 +19,7 @@ from mm_qbank.llm.jsonutil import parse_json_object
 from mm_qbank.llm.retry import call_with_retries_timeout
 from mm_qbank.pipeline.vlm_merge import row_aggregate_key
 from mm_qbank.prompts_loader import (
+    lecture_content_repair_prompts,
     lecture_content_system,
     lecture_content_user_payload_by_row,
     lecture_content_user_payload_by_tihao,
@@ -264,8 +265,6 @@ def run_lecture_content_on_refined_rows(
     text_model = resolve_llm_model(cfg, override=model)
     web_search = bool(lcfg.get("web_search", False))
     temp = float(lcfg.get("temperature", 0.4))
-    max_tokens_raw = lcfg.get("max_tokens", 8192)
-    max_tokens = max(1, int(max_tokens_raw)) if max_tokens_raw is not None else None
     timeout = float(
         lcfg.get("timeout_seconds", rcfg.get("timeout_seconds", 300.0) or 300.0) or 300.0
     )
@@ -395,7 +394,6 @@ def run_lecture_content_on_refined_rows(
                             {"role": "user", "content": up},
                         ],
                         temperature=temp,
-                        max_tokens=max_tokens,
                         timeout=float(tout),
                     )
                 except Exception:  # noqa: BLE001
@@ -406,7 +404,6 @@ def run_lecture_content_on_refined_rows(
                             {"role": "user", "content": up},
                         ],
                         temperature=temp,
-                        max_tokens=max_tokens,
                         timeout=None,
                     )
 
@@ -433,13 +430,63 @@ def run_lecture_content_on_refined_rows(
                 invalid_path = invalid_dir / f"batch_{bix:04d}.txt"
                 invalid_path.write_text(content, encoding="utf-8")
                 _log.warning(
-                    "lecture-content batch=%s/%s JSON 解析失败，原始回复已保存至 %s；整段回复写入「讲课内容」（要点留空）: %s",
+                    "lecture-content batch=%s/%s JSON 解析失败，原始回复已保存至 %s；尝试调用 LLM 修复: %s",
                     bix,
                     n_batches,
                     invalid_path,
                     e,
                 )
-                parsed = None
+                sys_p, usr_p = lecture_content_repair_prompts(raw=content)
+
+                def _repair_once(tout: float) -> str:
+                    try:
+                        return c.chat_text_json(
+                            model=text_model,
+                            messages=[
+                                {"role": "system", "content": sys_p},
+                                {"role": "user", "content": usr_p},
+                            ],
+                            temperature=0.0,
+                            timeout=float(tout),
+                        )
+                    except Exception:  # noqa: BLE001
+                        return c.chat_text_json(
+                            model=text_model,
+                            messages=[
+                                {"role": "system", "content": sys_p},
+                                {"role": "user", "content": usr_p},
+                            ],
+                            temperature=0.0,
+                            timeout=None,
+                        )
+
+                repaired = call_with_retries_timeout(
+                    _repair_once,
+                    tries=2,
+                    base_timeout_s=float(timeout),
+                    base_sleep_s=1.0,
+                    on_retry=lambda att, e, s, nt: _log.warning(
+                        "lecture-content JSON 修复重试 batch=%s/%s att=%s/2 sleep=%.2fs err=%s: %s",
+                        bix,
+                        n_batches,
+                        att + 1,
+                        s,
+                        type(e).__name__,
+                        e,
+                    ),
+                )
+                try:
+                    parsed = _parse_items_json(repaired)
+                    content = repaired
+                    _log.info("lecture-content batch=%s/%s JSON 修复成功", bix, n_batches)
+                except json.JSONDecodeError as e2:
+                    _log.warning(
+                        "lecture-content batch=%s/%s JSON 修复仍失败，整段原始回复写入「讲课内容」（要点留空）: %s",
+                        bix,
+                        n_batches,
+                        e2,
+                    )
+                    parsed = None
 
             flat_csv: list[dict[str, Any]]
             if parsed is None:

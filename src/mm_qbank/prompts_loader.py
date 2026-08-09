@@ -163,3 +163,14 @@ def lecture_content_user_payload_by_row(
         .replace("__BATCH_ID__", batch_id)
         .replace("__ITEMS_JSON__", json.dumps(items, ensure_ascii=False, indent=2))
     )
+
+
+def lecture_content_repair_prompts(*, raw: str) -> tuple[str, str]:
+    """顶层 JSON 结构修复：将无法解析的原始回复交给 LLM 修复后重试解析。"""
+    sys_p = get_prompt(
+        "lecture_content_repair_system.txt", _fb.LECTURE_CONTENT_REPAIR_SYSTEM
+    )
+    body = get_prompt(
+        "lecture_content_repair_user.txt", _fb.LECTURE_CONTENT_REPAIR_USER
+    )
+    return sys_p, body.replace("__RAW_JSON__", raw)
